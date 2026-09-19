@@ -1,3 +1,34 @@
-# Virtual environments
+# Virtual Environments
 venv/
 env/
+.venv/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment Variables
+.env
+*.env
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Data Folders
+data/01_raw/*
+data/02_interim/*
+data/03_processed/*
+
+# Exceptions
+!data/01_raw/.gitkeep
+!data/02_interim/.gitkeep
+!data/03_processed/.gitkeep
+
+# IDE Files
+.vscode/
+.cursor/
+
+# OS Files
+.DS_Store
+Thumbs.db
