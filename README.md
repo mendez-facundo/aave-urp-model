@@ -1,12 +1,12 @@
 # User Risk Premium Model
 
-**Stochastic IFRS 9 calibration of the User Risk Premium and Liquidity Hub provisioning for Aave v4, using discrete-time Markov chains and extreme value theory.**
+**Stochastic calibration of the User Risk Premium and Liquidity Hub provisioning for Aave v4, using discrete-time Markov chains and extreme value theory.**
 
 ## Abstract / Architecture
 
 Aave v4 transitions toward a Hub & Spoke architecture where a User Risk Premium (URP) prices individual borrower risk to fund the Liquidity Hub's insolvency reserves. While this mechanism is designed to absorb bad debt, the underlying risk parameters currently depend on static, high-latency DAO governance votes. This rigidity reproduces structural flaws: it penalizes safe collateral during stability and undercapitalizes the protocol during severe market stress, forcing reliance on the Safety Module and risking procyclical death spirals.
 
-This repository presents a stochastic, IFRS 9-compliant Expected Credit Loss (ECL) engine designed to autonomously calibrate the URP. By decoupling Probability of Default (PD) via discrete-time Markov chains and Loss Given Default (LGD) via Extreme Value Theory, this framework transforms the URP from a static heuristic into a continuous, risk-based actuarial provision.
+This repository presents a stochastic Expected Credit Loss (ECL) engine designed to autonomously calibrate the URP. By decoupling Probability of Default (PD) via discrete-time Markov chains and Loss Given Default (LGD) via Extreme Value Theory, this framework transforms the URP from a static heuristic into a continuous, risk-based actuarial provision.
 
 This repository implements a two-pillar quantitative architecture that replaces static premia with scenario-contingent risk measures:
 
@@ -44,8 +44,8 @@ aave-urp-model/
 │   └── 04_ecl_urp_results.ipynb
 ├── src/
 │   ├── extraction/
-│   │   ├── binance_agent.py           # Daily BTC/ETH/UNI klines
-│   │   ├── extract_active_wallets.py  # Wallet universe (The Graph, time-travel)
+│   │   ├── binance_agent.py           # Daily BTC/ETH/UNI/LINK klines
+│   │   ├── extract_active_wallets.py  # Wallet universe (The Graph)
 │   │   ├── aave_rpc_agent.py          # Archive RPC collateral/debt snapshot
 │   │   └── aave_graph_agent.py        # 30-day GraphQL position/liquidation history
 │   ├── processing/
@@ -116,7 +116,7 @@ ALCHEMY_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/<YOUR_API_KEY>
 GRAPH_API_KEY=<YOUR_GRAPH_API_KEY>
 ```
 
-`ALCHEMY_RPC_URL` is mandatory for `aave_rpc_agent.py`. `GRAPH_API_KEY` is mandatory for `extract_active_wallets.py` (and for the optional GraphQL history agent).
+`ALCHEMY_RPC_URL` is mandatory for `aave_rpc_agent.py`. `GRAPH_API_KEY` is mandatory for `extract_active_wallets.py`.
 
 ## Usage: Data Extraction Pipeline
 
@@ -124,7 +124,7 @@ All commands are executed from the **repository root**. Each agent writes into `
 
 ### Step 1 — Market prices (Binance)
 
-Downloads approximately two years of daily OHLCV for `BTCUSDT`, `ETHUSDT`, and `UNIUSDT`, ending on **2024-03-15** (baseline) and **2024-08-05** (stress). No API key is required.
+Downloads approximately two years of daily OHLCV for `BTCUSDT`, `ETHUSDT`, `UNIUSDT` and `LINKUSDT`, ending on **2024-03-15** (baseline) and **2024-08-05** (stress). No API key is required.
 
 ```bash
 python src/extraction/binance_agent.py
@@ -132,8 +132,8 @@ python src/extraction/binance_agent.py
 
 **Outputs**
 
-- `data/01_raw/baseline_mar2024/binance_prices_{btc,eth,uni}.csv`
-- `data/01_raw/stress_aug2024/binance_prices_{btc,eth,uni}.csv`
+- `data/01_raw/baseline_mar2024/binance_prices_{btc,eth,uni,link}.csv`
+- `data/01_raw/stress_aug2024/binance_prices_{btc,eth,uni,link}.csv`
 
 
 

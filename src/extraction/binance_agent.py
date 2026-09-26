@@ -245,7 +245,7 @@ def save_prices_csv(prices: pd.DataFrame, output_path: Path) -> None:
 
 
 def run_extraction() -> None:
-    """Download ETH and UNI daily prices for the baseline and stress scenarios."""
+    """Download historical daily prices for the baseline and stress scenarios."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -260,6 +260,7 @@ def run_extraction() -> None:
         ("ETHUSDT", "binance_prices_eth.csv"),
         ("UNIUSDT", "binance_prices_uni.csv"),
         ("BTCUSDT", "binance_prices_btc.csv"),
+        ("LINKUSDT", "binance_prices_link.csv"),
     ]
 
     for end_date, output_dir in scenarios:
