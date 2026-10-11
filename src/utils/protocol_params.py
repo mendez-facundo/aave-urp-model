@@ -10,6 +10,10 @@ Conventions shared with the extractor:
 
 * ``ltv`` and ``liquidation_threshold`` are fractions (raw basis points / 10000).
 * ``liquidation_bonus`` is the fraction above par (raw value / 10000 - 1).
+
+Extra columns are kept: ``emode_id`` in the reserve file (the reserve's eMode
+category, ``0`` if none) is validated and returned as int64, and any other
+unknown column is returned as stripped text, after the schema columns.
 """
 
 from __future__ import annotations
@@ -53,6 +57,8 @@ _RESERVE_SCHEMA: Dict[str, str] = {
     "usage_as_collateral_enabled": "bool",
 }
 _RESERVE_KEY: List[str] = ["date", "symbol"]
+# Typed columns that are validated and converted when present but not required.
+_RESERVE_OPTIONAL: Dict[str, str] = {"emode_id": "uint"}
 
 _EMODE_SCHEMA: Dict[str, str] = {
     "date": "date",
@@ -116,7 +122,8 @@ def load_reserve_params(
     Returns:
         DataFrame with the reserve parameter columns. ``block`` and ``decimals``
         are int64, the fraction columns are float64, and
-        ``usage_as_collateral_enabled`` is bool.
+        ``usage_as_collateral_enabled`` is bool. If the file has an ``emode_id``
+        column it is returned as int64; other extra columns are returned as text.
 
     Raises:
         ValueError: If the scenario is unknown, the file is invalid, or no rows
@@ -124,7 +131,9 @@ def load_reserve_params(
         FileNotFoundError: If the parameter file does not exist.
     """
     path = _protocol_file(scenario, RESERVE_PARAMS_FILE, raw_dir)
-    df = _read_protocol_csv(path, _RESERVE_SCHEMA, _RESERVE_KEY, "reserve parameters")
+    df = _read_protocol_csv(
+        path, _RESERVE_SCHEMA, _RESERVE_KEY, "reserve parameters", optional=_RESERVE_OPTIONAL
+    )
     return _select_as_of(df, date, path)
 
 
@@ -278,11 +287,14 @@ def _read_protocol_csv(
     schema: Dict[str, str],
     key: List[str],
     label: str,
+    optional: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """Read, validate and type-convert one protocol parameter CSV.
 
     Every invalid cell or row is collected and reported together, and duplicate
-    keys are rejected.
+    keys are rejected. Columns in ``optional`` are typed and validated when the
+    file has them; any other extra column is kept as stripped text after the
+    schema columns.
 
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -301,19 +313,27 @@ def _read_protocol_csv(
     if raw.empty:
         raise ValueError(f"{path}: no data rows")
 
+    typed: Dict[str, str] = {
+        **schema,
+        **{column: kind for column, kind in (optional or {}).items() if column in raw.columns},
+    }
+    extras = [column for column in raw.columns if column not in typed]
+
     problems: List[str] = []
     records: List[Dict[str, object]] = []
     for position, row in enumerate(raw.to_dict("records")):
         line = position + 2  # line 1 is the header
         record: Dict[str, object] = {}
-        for column, kind in schema.items():
+        for column, kind in typed.items():
             text = str(row[column]).strip()
             try:
                 record[column] = _parse_cell(text, kind)
             except ValueError as exc:
                 problems.append(f"line {line}: {column}={text!r}: {exc}")
-        if len(record) == len(schema):
+        if len(record) == len(typed):
             problems.extend(_check_fraction_row(line, record))
+        for column in extras:
+            record[column] = str(row[column]).strip()
         records.append(record)
 
     if problems:
@@ -323,13 +343,13 @@ def _read_protocol_csv(
             message += f"\n  ... and {len(problems) - len(shown)} more"
         raise ValueError(message)
 
-    df = pd.DataFrame(records, columns=list(schema))
+    df = pd.DataFrame(records, columns=[*typed, *extras])
     duplicated = df.duplicated(subset=key, keep=False)
     if duplicated.any():
         keys = sorted({tuple(item) for item in df.loc[duplicated, key].itertuples(index=False)})
         raise ValueError(f"{path}: duplicate {key} rows, e.g. {keys[:5]}")
 
-    df = df.astype({col: _DTYPES[kind] for col, kind in schema.items() if kind in _DTYPES})
+    df = df.astype({col: _DTYPES[kind] for col, kind in typed.items() if kind in _DTYPES})
     return df.sort_values(key, kind="stable").reset_index(drop=True)
 
 

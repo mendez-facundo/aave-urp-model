@@ -234,6 +234,25 @@ def test_validation_errors() -> None:
         expect_raises(FileNotFoundError, load_reserve_params, "baseline", raw_dir=Path(tmp))
 
 
+def test_extra_columns_are_kept() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_dir = Path(tmp)
+        rows = [f"{row},{1 if 'WETH' in row else 0},note" for row in GOOD_RESERVE_ROWS]
+        write_csv(raw_dir, "baseline_mar2024", "reserve_params_daily.csv",
+                  RESERVE_HEADER + ",emode_id,comment", rows)
+        df = load_reserve_params("baseline", date="2024-03-15", raw_dir=raw_dir)
+        assert list(df.columns)[-2:] == ["emode_id", "comment"], list(df.columns)
+        assert df["emode_id"].dtype.kind == "i"
+        assert df.set_index("symbol")["emode_id"].to_dict() == {"USDC": 0, "WBTC": 0, "WETH": 1}
+        assert set(df["comment"]) == {"note"}
+
+        # A non-integer emode_id is rejected like any other typed column.
+        bad = [rows[0].replace(",1,note", ",x,note")] + rows[1:]
+        write_csv(raw_dir, "baseline_mar2024", "reserve_params_daily.csv",
+                  RESERVE_HEADER + ",emode_id,comment", bad)
+        expect_raises(ValueError, load_reserve_params, "baseline", raw_dir=raw_dir, contains="emode_id")
+
+
 def test_emode_as_of_lookup() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         raw_dir = Path(tmp)
