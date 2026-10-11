@@ -30,6 +30,8 @@ PRICE_PROXIES: Dict[str, str] = {
 
 DEFAULT_LIQUIDATION_THRESHOLD: float = 0.80
 
+# DEPRECATED: use src.utils.protocol_params.load_reserve_params (real per-day Aave v3
+# values). Kept only because notebooks still import it; remove once notebooks migrate.
 LIQUIDATION_THRESHOLDS: Dict[str, float] = {
     "ETH": 0.825,
     "WETH": 0.825,
