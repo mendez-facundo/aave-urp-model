@@ -40,6 +40,28 @@ KLINE_COLUMNS = [
     "ignore",
 ]
 OUTPUT_COLUMNS = ["timestamp", "date", "open", "high", "low", "close", "volume"]
+LONG_OUTPUT_COLUMNS = [
+    "date",
+    "ticker",
+    "timestamp",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+]
+LONG_PRICES_RELATIVE_PATH = Path("prices") / "binance_daily.csv"
+
+SCENARIOS: list[tuple[str, Path]] = [
+    ("2024-03-15", BASELINE_DIR),
+    ("2024-08-05", STRESS_DIR),
+]
+ASSETS: list[tuple[str, str]] = [
+    ("ETHUSDT", "binance_prices_eth.csv"),
+    ("UNIUSDT", "binance_prices_uni.csv"),
+    ("BTCUSDT", "binance_prices_btc.csv"),
+    ("LINKUSDT", "binance_prices_link.csv"),
+]
 
 
 class BinanceAPIError(RuntimeError):
@@ -244,6 +266,17 @@ def save_prices_csv(prices: pd.DataFrame, output_path: Path) -> None:
     logger.info("Wrote %s rows to %s", len(prices), output_path)
 
 
+def combine_prices_long(prices_by_ticker: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Stack per-ticker price frames into one long frame sorted by ticker then date."""
+    frames = [prices.assign(ticker=ticker) for ticker, prices in prices_by_ticker.items()]
+    if not frames:
+        return pd.DataFrame(columns=LONG_OUTPUT_COLUMNS)
+
+    long_frame = pd.concat(frames, ignore_index=True)
+    long_frame = long_frame.sort_values(["ticker", "date"]).reset_index(drop=True)
+    return long_frame[LONG_OUTPUT_COLUMNS]
+
+
 def run_extraction() -> None:
     """Download historical daily prices for the baseline and stress scenarios."""
     logging.basicConfig(
@@ -252,22 +285,13 @@ def run_extraction() -> None:
     )
     ensure_raw_scenario_directories()
 
-    scenarios: list[tuple[str, Path]] = [
-        ("2024-03-15", BASELINE_DIR),
-        ("2024-08-05", STRESS_DIR),
-    ]
-    assets: list[tuple[str, str]] = [
-        ("ETHUSDT", "binance_prices_eth.csv"),
-        ("UNIUSDT", "binance_prices_uni.csv"),
-        ("BTCUSDT", "binance_prices_btc.csv"),
-        ("LINKUSDT", "binance_prices_link.csv"),
-    ]
-
-    for end_date, output_dir in scenarios:
-        for asset, filename in assets:
+    for end_date, output_dir in SCENARIOS:
+        prices_by_ticker: dict[str, pd.DataFrame] = {}
+        for asset, filename in ASSETS:
             try:
                 prices = download_historical_prices(asset=asset, end_date=end_date)
                 save_prices_csv(prices, output_dir / filename)
+                prices_by_ticker[asset] = prices
             except (BinanceAPIError, ValueError, requests.RequestException) as exc:
                 logger.error(
                     "Failed to extract %s for end_date=%s: %s",
@@ -276,6 +300,11 @@ def run_extraction() -> None:
                     exc,
                 )
                 raise
+
+        save_prices_csv(
+            combine_prices_long(prices_by_ticker),
+            output_dir / LONG_PRICES_RELATIVE_PATH,
+        )
 
 
 if __name__ == "__main__":
