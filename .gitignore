@@ -35,3 +35,4 @@ Thumbs.db
 # Local development samples (derived from raw data)
 data/sample/*
 !data/sample/.gitkeep
+!data/sample/README.md
