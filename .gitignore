@@ -32,3 +32,6 @@ data/03_processed/*
 # OS Files
 .DS_Store
 Thumbs.db
+# Local development samples (derived from raw data)
+data/sample/*
+!data/sample/.gitkeep
