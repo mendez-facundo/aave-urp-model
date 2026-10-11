@@ -1,441 +1,1202 @@
-"""Aave v3 Ethereum The Graph extractor for the Markov actuarial pipeline."""
+"""Aave v3 Ethereum daily snapshots from The Graph, queried with time-travel.
+
+The panel for the Markov chain must look exactly as if it had been queried on
+each day of 2024. For every UTC day ``D`` of a scenario window the extractor
+resolves the block ``B`` (first block with ``timestamp >= D 00:00:00 UTC``, see
+``src.utils.blocks.daily_blocks``) and asks the Aave v3 Ethereum subgraph for
+its state *at that block* with ``block: {number: B}``. The queries, the schema
+names and the balance formula were validated in the T1.1 spike
+(``docs/spikes/T1.1_graph_spike.md``).
+
+Windows (inclusive, 61 days each, ``[t - 30, t + 30]``):
+
+* baseline: ``2024-02-14 .. 2024-04-14`` (t = 2024-03-15), folder ``baseline_mar2024``.
+* stress: ``2024-07-06 .. 2024-09-04`` (t = 2024-08-05), folder ``stress_aug2024``.
+
+Outputs, under ``<out-root>/<scenario_folder>/``:
+
+* ``thegraph_daily/positions_<YYYY-MM-DD>.csv.gz``: one row per (user, reserve)
+  of every borrower at block ``B`` (``borrowedReservesCount > 0``) with any
+  non-zero balance. Columns: ``date, block, user_id, emode_category_id,
+  reserve_symbol, underlying_asset, decimals, usage_as_collateral_enabled,
+  scaled_a_token_balance, scaled_variable_debt, current_stable_debt,
+  liquidity_index, variable_borrow_index`` (raw integers, written as digits) and
+  ``a_token_balance, variable_debt, stable_debt`` (floats in token units).
+  Read the raw-integer columns with ``dtype=str`` (the indices have 27 digits,
+  which do not fit in int64). ``emode_category_id`` is ``0`` when the user has no
+  eMode category (the subgraph returns null), as on chain.
+* ``thegraph_daily/metadata.json``: subgraph id, window, and per day the block,
+  borrower count, row count and extraction timestamp.
+* ``protocol/reserve_params_daily.csv`` and ``protocol/emode_categories_daily.csv``:
+  reserve and eMode parameters per day, in the schema read by
+  ``src.utils.protocol_params`` (fractions; liquidation bonus as the fraction
+  above par, raw values below 10000 map to 0.0; lowercase addresses). The reserve
+  file has one extra column, ``emode_id`` (``Reserve.eMode.id``, ``0`` if none),
+  which the loader ignores: read the CSV directly to get the reserve -> eMode link.
+* ``protocol/daily_blocks.csv``: date to block cache shared with the other agents.
+* ``thegraph_events/liquidation_calls.csv`` and ``repays.csv``: all events with
+  ``timestamp`` in ``[start 00:00 UTC, end + 1 day 00:00 UTC)``, plus
+  ``thegraph_events/metadata.json``.
+
+Balance formula (never use the subgraph's ``currentATokenBalance`` /
+``currentVariableDebt``: they are frozen at the user's last own event, a median
+of 76 days before the block)::
+
+    a_token_balance = rayMul(scaledATokenBalance, reserve.liquidityIndex)
+    variable_debt   = rayMul(scaledVariableDebt,  reserve.variableBorrowIndex)
+
+with both indices taken at the same block ``B`` and integer arithmetic. Stable
+debt is zero for every row (stable borrowing is disabled) and is copied from
+``currentStableDebt``; the extractor logs a warning if it is ever non-zero.
+
+Event USD prices (``collateral_asset_price_usd``, ``borrow_asset_price_usd``,
+``asset_price_usd``) are kept as the subgraph reports them but are **not
+reliable**: they are 0 in about 20-27 % of liquidations. Use the raw amounts and
+the Aave oracle series instead. ``Repay`` has no ``onBehalfOf`` field: ``user_id``
+is the debtor and ``repayer_id`` the payer.
+
+Robustness: every request retries with exponential backoff on transport errors,
+HTTP 408/429/5xx and on HTTP-200 responses that carry a GraphQL ``errors`` array
+(for example ``bad indexers``). A day is written only after all its pages were
+fetched and validated: reserve parameters first, then the positions file, which
+is the per-day checkpoint (an existing file means the day is skipped). Files are
+written to a temporary name and renamed. Failed days are reported at the end and
+can be retried by running the same command again.
+
+Usage, from the repository root::
+
+    python -m src.extraction.aave_graph_agent [--scenario baseline|stress|all]
+        [--start YYYY-MM-DD --end YYYY-MM-DD] [--out-root PATH]
+        [--events-only | --positions-only]
+
+``GRAPH_API_KEY`` is read from ``.env``; neither the key nor the gateway URL is
+ever logged.
+"""
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
+import random
+import sys
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-import requests
-from dotenv import load_dotenv
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    # Allow `python src/extraction/aave_graph_agent.py` from the repository root.
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import pandas as pd  # noqa: E402
+import requests  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
+
+from src.utils.blocks import daily_blocks  # noqa: E402
+from src.utils.protocol_params import (  # noqa: E402
+    load_emode_categories,
+    load_reserve_params,
+    raw_bonus_to_fraction,
+    raw_bps_to_fraction,
+)
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-RAW_DATA_DIR = PROJECT_ROOT / "data" / "01_raw"
-BASELINE_DIR = RAW_DATA_DIR / "baseline_mar2024"
-STRESS_DIR = RAW_DATA_DIR / "stress_aug2024"
-
 load_dotenv(PROJECT_ROOT / ".env")
 
-GRAPH_API_KEY = os.getenv("GRAPH_API_KEY", "").strip()
+RAW_DATA_DIR = PROJECT_ROOT / "data" / "01_raw"
+
 AAVE_V3_ETHEREUM_SUBGRAPH_ID = "Cd2gEDVeqnjBn1hSeqFMitw8Q1iiyV9FYUZkLNRcL87g"
 GRAPH_GATEWAY_BASE = "https://gateway-arbitrum.network.thegraph.com/api"
 
-WINDOW_DAYS = 30
-PAGE_SIZE = 1000
-REQUEST_TIMEOUT_SECONDS = 60
-MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 2.0
-PAGE_SLEEP_SECONDS = 0.25
+DATE_FORMAT = "%Y-%m-%d"
+PAGE_SIZE = 1000  # safe maximum: some indexers reject first > 1000
+NESTED_RESERVES_LIMIT = 100  # observed maximum per borrower: 22
+PAGE_SLEEP_SECONDS = 0.2
+REQUEST_TIMEOUT_SECONDS = 120
+MAX_ATTEMPTS = 8
+RETRY_BASE_SECONDS = 2.0
+RETRY_MAX_SECONDS = 60.0
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+# GraphQL errors that a retry cannot fix (bad query, not a bad indexer).
+NON_RETRYABLE_ERROR_MARKERS = (
+    "cannot query field",
+    "has no field",
+    "unknown argument",
+    "unknown type",
+    "validation error",
+    "syntax error",
+    "must be between 0 and",
+)
+MAX_CONSECUTIVE_DAY_FAILURES = 3
 
-BASELINE_END = datetime(2024, 3, 15, tzinfo=timezone.utc)
-STRESS_END = datetime(2024, 8, 5, tzinfo=timezone.utc)
+RAY = 10**27
+HALF_RAY = RAY // 2
 
-USERS_QUERY = """
-query FetchUsers(
-  $first: Int!
-  $lastId: ID!
-  $startTimestamp: Int!
-  $endTimestamp: Int!
-) {
+PROTOCOL_DIR = "protocol"
+DAILY_DIR = "thegraph_daily"
+EVENTS_DIR = "thegraph_events"
+BLOCKS_FILE = "daily_blocks.csv"
+RESERVE_PARAMS_FILE = "reserve_params_daily.csv"
+EMODE_CATEGORIES_FILE = "emode_categories_daily.csv"
+LIQUIDATIONS_FILE = "liquidation_calls.csv"
+REPAYS_FILE = "repays.csv"
+METADATA_FILE = "metadata.json"
+
+POSITION_COLUMNS = [
+    "date",
+    "block",
+    "user_id",
+    "emode_category_id",
+    "reserve_symbol",
+    "underlying_asset",
+    "decimals",
+    "usage_as_collateral_enabled",
+    "scaled_a_token_balance",
+    "scaled_variable_debt",
+    "current_stable_debt",
+    "liquidity_index",
+    "variable_borrow_index",
+    "a_token_balance",
+    "variable_debt",
+    "stable_debt",
+]
+RESERVE_PARAM_COLUMNS = [
+    "date",
+    "block",
+    "symbol",
+    "underlying_asset",
+    "decimals",
+    "ltv",
+    "liquidation_threshold",
+    "liquidation_bonus",
+    "usage_as_collateral_enabled",
+    "emode_id",
+]
+RESERVE_PARAM_KEY = ["date", "symbol"]
+EMODE_COLUMNS = [
+    "date",
+    "block",
+    "emode_id",
+    "label",
+    "ltv",
+    "liquidation_threshold",
+    "liquidation_bonus",
+]
+EMODE_KEY = ["date", "emode_id"]
+LIQUIDATION_COLUMNS = [
+    "id",
+    "tx_hash",
+    "action",
+    "timestamp",
+    "date",
+    "user_id",
+    "liquidator",
+    "collateral_reserve_id",
+    "collateral_symbol",
+    "collateral_underlying_asset",
+    "collateral_decimals",
+    "principal_reserve_id",
+    "principal_symbol",
+    "principal_underlying_asset",
+    "principal_decimals",
+    "collateral_amount",
+    "principal_amount",
+    "collateral_asset_price_usd",
+    "borrow_asset_price_usd",
+]
+REPAY_COLUMNS = [
+    "id",
+    "tx_hash",
+    "action",
+    "timestamp",
+    "date",
+    "user_id",
+    "repayer_id",
+    "reserve_id",
+    "reserve_symbol",
+    "underlying_asset",
+    "decimals",
+    "amount",
+    "asset_price_usd",
+    "use_a_tokens",
+]
+
+# ---------------------------------------------------------------------------
+# Queries (validated in the T1.1 spike, scripts/spikes/graph_spike.py).
+# ---------------------------------------------------------------------------
+
+USERS_SNAPSHOT_QUERY = """
+query UsersSnapshot($first: Int!, $lastId: ID!, $block: Int!) {
   users(
     first: $first
     orderBy: id
     orderDirection: asc
+    block: { number: $block }
     where: { borrowedReservesCount_gt: 0, id_gt: $lastId }
   ) {
     id
     borrowedReservesCount
-    eModeCategoryId {
-      id
-      ltv
-      liquidationThreshold
-      liquidationBonus
-      label
-    }
+    eModeCategoryId { id }
     reserves(first: 100) {
-      id
       usageAsCollateralEnabledOnUser
       scaledATokenBalance
-      currentATokenBalance
       scaledVariableDebt
-      currentVariableDebt
       principalStableDebt
       currentStableDebt
-      currentTotalDebt
-      lastUpdateTimestamp
-      reserve {
-        id
-        symbol
-        name
-        decimals
-        underlyingAsset
-        baseLTVasCollateral
-        reserveLiquidationThreshold
-        reserveLiquidationBonus
-        liquidityIndex
-        variableBorrowIndex
-        lastUpdateTimestamp
-        price {
-          priceInEth
-        }
-      }
-      aTokenBalanceHistory(
-        first: 1000
-        orderBy: timestamp
-        orderDirection: asc
-        where: { timestamp_gte: $startTimestamp, timestamp_lte: $endTimestamp }
-      ) {
-        id
-        timestamp
-        scaledATokenBalance
-        currentATokenBalance
-        index
-      }
-      vTokenBalanceHistory(
-        first: 1000
-        orderBy: timestamp
-        orderDirection: asc
-        where: { timestamp_gte: $startTimestamp, timestamp_lte: $endTimestamp }
-      ) {
-        id
-        timestamp
-        scaledVariableDebt
-        currentVariableDebt
-        index
-      }
-      sTokenBalanceHistory(
-        first: 1000
-        orderBy: timestamp
-        orderDirection: asc
-        where: { timestamp_gte: $startTimestamp, timestamp_lte: $endTimestamp }
-      ) {
-        id
-        timestamp
-        principalStableDebt
-        currentStableDebt
-        avgStableBorrowRate
-      }
+      reserve { id symbol underlyingAsset decimals liquidityIndex variableBorrowIndex }
     }
   }
 }
 """
 
-LIQUIDATION_CALLS_QUERY = """
-query FetchLiquidationCalls(
-  $first: Int!
-  $lastId: ID!
-  $startTimestamp: Int!
-  $endTimestamp: Int!
-) {
+RESERVES_QUERY = """
+query ReservesAtBlock($block: Int!) {
+  reserves(first: 200, block: { number: $block }) {
+    id
+    symbol
+    underlyingAsset
+    decimals
+    usageAsCollateralEnabled
+    baseLTVasCollateral
+    reserveLiquidationThreshold
+    reserveLiquidationBonus
+    eMode { id }
+  }
+  emodeCategories(first: 50, block: { number: $block }) {
+    id
+    label
+    ltv
+    liquidationThreshold
+    liquidationBonus
+  }
+}
+"""
+
+LIQUIDATIONS_QUERY = """
+query Liquidations($first: Int!, $lastId: ID!, $t0: Int!, $t1: Int!) {
   liquidationCalls(
     first: $first
     orderBy: id
     orderDirection: asc
-    where: {
-      timestamp_gte: $startTimestamp
-      timestamp_lte: $endTimestamp
-      id_gt: $lastId
-    }
+    where: { timestamp_gte: $t0, timestamp_lt: $t1, id_gt: $lastId }
   ) {
     id
     txHash
     action
     timestamp
     liquidator
+    user { id }
     collateralAmount
     principalAmount
     collateralAssetPriceUSD
     borrowAssetPriceUSD
-    user {
-      id
-    }
-    collateralReserve {
-      id
-      symbol
-      decimals
-      underlyingAsset
-      reserveLiquidationThreshold
-      reserveLiquidationBonus
-    }
-    principalReserve {
-      id
-      symbol
-      decimals
-      underlyingAsset
-    }
+    collateralReserve { id symbol underlyingAsset decimals }
+    principalReserve { id symbol underlyingAsset decimals }
+  }
+}
+"""
+
+REPAYS_QUERY = """
+query Repays($first: Int!, $lastId: ID!, $t0: Int!, $t1: Int!) {
+  repays(
+    first: $first
+    orderBy: id
+    orderDirection: asc
+    where: { timestamp_gte: $t0, timestamp_lt: $t1, id_gt: $lastId }
+  ) {
+    id
+    txHash
+    action
+    timestamp
+    user { id }
+    repayer { id }
+    amount
+    assetPriceUSD
+    useATokens
+    reserve { id symbol underlyingAsset decimals }
   }
 }
 """
 
 
+@dataclass(frozen=True)
+class Scenario:
+    """Folder and inclusive extraction window of one scenario."""
+
+    name: str
+    folder: str
+    start: str
+    end: str
+
+
+SCENARIOS: dict[str, Scenario] = {
+    "baseline": Scenario("baseline", "baseline_mar2024", "2024-02-14", "2024-04-14"),
+    "stress": Scenario("stress", "stress_aug2024", "2024-07-06", "2024-09-04"),
+}
+
+
 class GraphAPIError(RuntimeError):
-    """Raised when The Graph gateway cannot be queried successfully."""
+    """Raised when a request still fails after all retries."""
 
 
-def _build_subgraph_url() -> str:
-    """Build the decentralized Aave v3 Ethereum subgraph endpoint."""
-    if not GRAPH_API_KEY:
-        raise GraphAPIError(
-            "GRAPH_API_KEY is missing. Set it in the project .env file."
-        )
-    return (
-        f"{GRAPH_GATEWAY_BASE}/{GRAPH_API_KEY}/subgraphs/id/"
-        f"{AAVE_V3_ETHEREUM_SUBGRAPH_ID}"
-    )
+class GraphFatalError(GraphAPIError):
+    """Raised for failures a retry cannot fix (bad key, bad query); aborts the run."""
 
 
-def ensure_raw_scenario_directories() -> None:
-    """Create raw data scenario directories if they do not already exist."""
-    for directory in (BASELINE_DIR, STRESS_DIR):
-        directory.mkdir(parents=True, exist_ok=True)
-        logger.info("Ensured directory exists: %s", directory)
+# ---------------------------------------------------------------------------
+# GraphQL client
+# ---------------------------------------------------------------------------
 
 
-def _window_bounds(end_timestamp: int) -> tuple[int, int]:
-    """Return the inclusive [start, end] Unix timestamps for a 30-day window."""
-    if end_timestamp <= 0:
-        raise ValueError(f"end_timestamp must be a positive Unix time, got {end_timestamp}.")
-    start_timestamp = end_timestamp - WINDOW_DAYS * 24 * 60 * 60
-    return start_timestamp, end_timestamp
+class GraphClient:
+    """GraphQL client for the Aave v3 Ethereum subgraph with retries.
 
-
-def _post_graphql(
-    query: str,
-    variables: dict[str, Any],
-    session: requests.Session,
-) -> dict[str, Any]:
-    """Execute a GraphQL request against The Graph with retries."""
-    url = _build_subgraph_url()
-    payload = {"query": query, "variables": variables}
-    last_error: Exception | None = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = session.post(
-                url,
-                json=payload,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-            if response.status_code in {429, 502, 503, 504}:
-                wait_seconds = RETRY_BACKOFF_SECONDS * attempt
-                logger.warning(
-                    "The Graph returned HTTP %s (attempt %s/%s). Retrying in %.1fs.",
-                    response.status_code,
-                    attempt,
-                    MAX_RETRIES,
-                    wait_seconds,
-                )
-                time.sleep(wait_seconds)
-                continue
-
-            response.raise_for_status()
-            body = response.json()
-            if not isinstance(body, dict):
-                raise GraphAPIError(f"Unexpected GraphQL payload type: {type(body)}")
-            if body.get("errors"):
-                raise GraphAPIError(f"GraphQL errors: {body['errors']}")
-            data = body.get("data")
-            if not isinstance(data, dict):
-                raise GraphAPIError(f"GraphQL response is missing a data object: {body}")
-            return data
-        except (requests.RequestException, ValueError, GraphAPIError) as exc:
-            last_error = exc
-            wait_seconds = RETRY_BACKOFF_SECONDS * attempt
-            logger.warning(
-                "The Graph request failed (attempt %s/%s): %s. Retrying in %.1fs.",
-                attempt,
-                MAX_RETRIES,
-                exc,
-                wait_seconds,
-            )
-            time.sleep(wait_seconds)
-
-    raise GraphAPIError(
-        f"Failed to query The Graph after {MAX_RETRIES} attempts."
-    ) from last_error
-
-
-def _paginate_entity(
-    query: str,
-    entity_key: str,
-    start_timestamp: int,
-    end_timestamp: int,
-    session: requests.Session,
-) -> list[dict[str, Any]]:
-    """Fetch every page of a GraphQL entity using cursor pagination (id_gt).
-
-    The Graph caps ``skip`` around 5,000 records, so this extractor pages with
-    ``first: 1000`` and ``id_gt`` instead of incrementing ``skip``.
-    """
-    records: list[dict[str, Any]] = []
-    last_id = ""
-    page_number = 0
-
-    while True:
-        page_number += 1
-        variables = {
-            "first": PAGE_SIZE,
-            "lastId": last_id,
-            "startTimestamp": start_timestamp,
-            "endTimestamp": end_timestamp,
-        }
-        data = _post_graphql(query, variables, session)
-        page = data.get(entity_key)
-        if not isinstance(page, list):
-            raise GraphAPIError(
-                f"Expected a list for '{entity_key}', got {type(page)}."
-            )
-
-        records.extend(page)
-        logger.info(
-            "Fetched %s page %s (%s rows, %s cumulative).",
-            entity_key,
-            page_number,
-            len(page),
-            len(records),
-        )
-
-        if len(page) < PAGE_SIZE:
-            break
-
-        next_id = page[-1].get("id")
-        if not next_id or next_id == last_id:
-            logger.warning(
-                "Pagination cursor for %s did not advance; stopping at %s rows.",
-                entity_key,
-                len(records),
-            )
-            break
-        last_id = str(next_id)
-        time.sleep(PAGE_SLEEP_SECONDS)
-
-    return records
-
-
-def save_history_json(payload: dict[str, Any], output_path: Path) -> None:
-    """Write the consolidated extraction payload to JSON."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-    logger.info("Wrote JSON payload to %s", output_path)
-
-
-def fetch_30d_history(end_timestamp: int, output_path: Path | None = None) -> dict[str, Any]:
-    """Fetch Aave v3 user positions and liquidations for a 30-day window.
-
-    The Aave subgraph does not store Health Factor directly. This function
-    extracts borrower ``users`` (collateral and debt balances plus 30-day
-    a/v/s-token history) and ``liquidationCalls`` in
-    ``[end_timestamp - 30 days, end_timestamp]`` so Health Factor can be
-    computed downstream.
+    Counts every HTTP request (including retries) in ``request_count`` and every
+    answered query in ``query_count``. The API key and the gateway URL are
+    removed from every message that leaves the class.
 
     Parameters
     ----------
-    end_timestamp:
-        Inclusive Unix timestamp (UTC seconds) that closes the 30-day window.
-    output_path:
-        Optional JSON destination. When provided, the consolidated payload is
-        written immediately after the GraphQL extraction completes.
+    api_key:
+        Gateway API key. Defaults to the ``GRAPH_API_KEY`` environment variable.
+    subgraph_id:
+        Deployment id of the subgraph.
+
+    Raises
+    ------
+    GraphFatalError
+        If no API key is configured.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        subgraph_id: str = AAVE_V3_ETHEREUM_SUBGRAPH_ID,
+    ) -> None:
+        key = (api_key if api_key is not None else os.getenv("GRAPH_API_KEY", "")).strip()
+        if not key:
+            raise GraphFatalError("GRAPH_API_KEY is missing. Set it in the project .env file.")
+        self._key = key
+        self._url = f"{GRAPH_GATEWAY_BASE}/{key}/subgraphs/id/{subgraph_id}"
+        self._session = requests.Session()
+        self.request_count = 0
+        self.query_count = 0
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(endpoint=<redacted>)"
+
+    def close(self) -> None:
+        """Close the underlying HTTP session."""
+        self._session.close()
+
+    def __enter__(self) -> "GraphClient":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def _scrub(self, text: str) -> str:
+        """Remove the API key and the endpoint URL from ``text``."""
+        return text.replace(self._url, "<url>").replace(self._key, "<key>")
+
+    def query(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        """Run one GraphQL query and return its ``data`` object.
+
+        Retries up to ``MAX_ATTEMPTS`` times with exponential backoff and jitter
+        on transport errors, retryable HTTP statuses, non-JSON bodies and
+        HTTP-200 responses carrying GraphQL ``errors`` (for example
+        ``bad indexers``).
+
+        Raises
+        ------
+        GraphFatalError
+            For non-retryable HTTP statuses (bad key, quota) and for GraphQL
+            errors that denote an invalid query.
+        GraphAPIError
+            If all attempts fail.
+        """
+        payload = {"query": query, "variables": variables}
+        reason = "no attempt made"
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            self.request_count += 1
+            try:
+                response = self._session.post(
+                    self._url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS
+                )
+            except requests.RequestException as exc:
+                # Exception text can echo the URL, so only the type name is kept.
+                reason = type(exc).__name__
+            else:
+                if response.status_code in RETRYABLE_STATUS:
+                    reason = f"HTTP {response.status_code}"
+                elif response.status_code != 200:
+                    snippet = self._scrub(response.text[:200])
+                    raise GraphFatalError(f"HTTP {response.status_code}: {snippet}")
+                else:
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = None
+                        reason = "response is not JSON"
+                    if isinstance(body, dict):
+                        errors = body.get("errors")
+                        if errors:
+                            message = self._scrub(json.dumps(errors))[:400]
+                            if any(m in message.lower() for m in NON_RETRYABLE_ERROR_MARKERS):
+                                raise GraphFatalError(f"GraphQL errors: {message}")
+                            reason = f"GraphQL errors: {message}"
+                        elif isinstance(body.get("data"), dict):
+                            self.query_count += 1
+                            return body["data"]
+                        else:
+                            reason = "response has no data object"
+                    elif body is not None:
+                        reason = "unexpected JSON payload"
+
+            if attempt == MAX_ATTEMPTS:
+                break
+            wait = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * 2 ** (attempt - 1))
+            wait += random.uniform(0.0, 1.0)
+            logger.warning(
+                "Graph request failed (attempt %s/%s): %s. Retrying in %.1fs.",
+                attempt,
+                MAX_ATTEMPTS,
+                reason,
+                wait,
+            )
+            time.sleep(wait)
+        raise GraphAPIError(f"Graph request failed after {MAX_ATTEMPTS} attempts: {reason}")
+
+    def paginate(
+        self,
+        query: str,
+        entity: str,
+        variables: dict[str, Any],
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield the pages of ``entity``, using ``first: 1000`` and ``id_gt`` cursors.
+
+        ``query`` must declare ``$first: Int!`` and ``$lastId: ID!`` and order by
+        ``id`` ascending. Iteration stops at the first page shorter than
+        ``PAGE_SIZE``.
+        """
+        last_id = ""
+        while True:
+            data = self.query(query, {**variables, "first": PAGE_SIZE, "lastId": last_id})
+            page = data.get(entity)
+            if not isinstance(page, list):
+                raise GraphAPIError(f"Expected a list for '{entity}', got {type(page).__name__}.")
+            yield page
+            if len(page) < PAGE_SIZE:
+                return
+            next_id = str(page[-1]["id"])
+            if next_id <= last_id:
+                raise GraphAPIError(f"Pagination cursor for '{entity}' did not advance.")
+            last_id = next_id
+            time.sleep(PAGE_SLEEP_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
+
+
+def ray_mul(a: int, b: int) -> int:
+    """Aave ``rayMul``: ``a * b / 1e27`` rounded half up, in integer arithmetic."""
+    return (a * b + HALF_RAY) // RAY
+
+
+def _parse_date(value: str) -> date:
+    """Parse ``YYYY-MM-DD`` into a ``date``."""
+    try:
+        return datetime.strptime(value, DATE_FORMAT).date()
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Expected a YYYY-MM-DD date, got {value!r}.") from exc
+
+
+def _utc_midnight_ts(day: date) -> int:
+    """Return the Unix timestamp of 00:00:00 UTC on ``day``."""
+    return int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp())
+
+
+def _date_range(start: str, end: str) -> list[date]:
+    """Return every date in ``[start, end]``."""
+    first, last = _parse_date(start), _parse_date(end)
+    if last < first:
+        raise ValueError(f"end {end} is before start {start}.")
+    return [first + timedelta(days=offset) for offset in range((last - first).days + 1)]
+
+
+def _utc_date_of(timestamp: int) -> str:
+    """Return the UTC calendar date of a Unix timestamp as ``YYYY-MM-DD``."""
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime(DATE_FORMAT)
+
+
+def _now_utc() -> str:
+    """Return the current UTC time as an ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _bonus_fraction(raw: int, what: str) -> float:
+    """Convert a raw liquidation bonus to the fraction above par; raw below par maps to 0.0."""
+    if raw == 0:
+        return 0.0
+    if raw < 10000:
+        logger.warning("%s: liquidation bonus %s is below par; stored as 0.0.", what, raw)
+        return 0.0
+    return raw_bonus_to_fraction(raw)
+
+
+def _check_param_ranges(rows: list[dict[str, Any]], what: str) -> None:
+    """Reject rows that ``protocol_params`` would refuse to load.
+
+    Raises
+    ------
+    ValueError
+        If ``0 <= ltv <= liquidation_threshold < 1`` or ``0 <= liquidation_bonus < 0.5``
+        fails for any row.
+    """
+    problems = []
+    for row in rows:
+        label = row.get("symbol", row.get("emode_id"))
+        ltv, threshold, bonus = row["ltv"], row["liquidation_threshold"], row["liquidation_bonus"]
+        if not 0 <= ltv <= threshold < 1:
+            problems.append(f"{label}: ltv={ltv}, liquidation_threshold={threshold}")
+        if not 0 <= bonus < 0.5:
+            problems.append(f"{label}: liquidation_bonus={bonus}")
+    if problems:
+        raise ValueError(f"{what}: parameters out of range: {problems[:5]}")
+
+
+def flatten_users(
+    users: list[dict[str, Any]],
+    day: str,
+    block: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Flatten borrowers into position rows, computing accrued balances.
+
+    Parameters
+    ----------
+    users:
+        ``users`` entities from ``USERS_SNAPSHOT_QUERY`` at ``block``.
+    day:
+        Snapshot date, ``YYYY-MM-DD``.
+    block:
+        Block the snapshot was taken at.
+
+    Returns
+    -------
+    tuple
+        ``(rows, stable_debt_rows)``: one dict per (user, reserve) with any
+        non-zero balance (keys are ``POSITION_COLUMNS``), and the number of rows
+        with a non-zero stable debt (expected 0).
+    """
+    rows: list[dict[str, Any]] = []
+    stable_rows = 0
+    for user in users:
+        category = user.get("eModeCategoryId")
+        emode_id = int(category["id"]) if category else 0
+        user_reserves = user["reserves"]
+        if len(user_reserves) >= NESTED_RESERVES_LIMIT:
+            logger.warning("User %s may have more than %s reserves.", user["id"], NESTED_RESERVES_LIMIT)
+        for entry in user_reserves:
+            scaled_a = int(entry["scaledATokenBalance"])
+            scaled_v = int(entry["scaledVariableDebt"])
+            stable = int(entry["currentStableDebt"])
+            principal_stable = int(entry["principalStableDebt"])
+            if not (scaled_a or scaled_v or stable or principal_stable):
+                continue
+            if stable or principal_stable:
+                stable_rows += 1
+            reserve = entry["reserve"]
+            decimals = int(reserve["decimals"])
+            liquidity_index = int(reserve["liquidityIndex"])
+            borrow_index = int(reserve["variableBorrowIndex"])
+            unit = 10**decimals
+            rows.append(
+                {
+                    "date": day,
+                    "block": block,
+                    "user_id": user["id"],
+                    "emode_category_id": emode_id,
+                    "reserve_symbol": reserve["symbol"],
+                    "underlying_asset": reserve["underlyingAsset"].lower(),
+                    "decimals": decimals,
+                    "usage_as_collateral_enabled": bool(entry["usageAsCollateralEnabledOnUser"]),
+                    "scaled_a_token_balance": str(scaled_a),
+                    "scaled_variable_debt": str(scaled_v),
+                    "current_stable_debt": str(stable),
+                    "liquidity_index": str(liquidity_index),
+                    "variable_borrow_index": str(borrow_index),
+                    "a_token_balance": ray_mul(scaled_a, liquidity_index) / unit,
+                    "variable_debt": ray_mul(scaled_v, borrow_index) / unit,
+                    "stable_debt": stable / unit,
+                }
+            )
+    return rows, stable_rows
+
+
+def build_param_rows(
+    data: dict[str, Any],
+    day: str,
+    block: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Convert a ``RESERVES_QUERY`` answer into reserve and eMode parameter rows.
+
+    Returns
+    -------
+    tuple
+        ``(reserve_rows, emode_rows)`` keyed by ``RESERVE_PARAM_COLUMNS`` and
+        ``EMODE_COLUMNS``, with LTV and liquidation threshold as fractions and
+        the liquidation bonus as the fraction above par.
+
+    Raises
+    ------
+    ValueError
+        If symbols repeat within a day or a row is outside the ranges accepted
+        by ``src.utils.protocol_params``.
+    """
+    reserve_rows = []
+    for item in sorted(data["reserves"], key=lambda r: r["symbol"]):
+        emode = item.get("eMode")
+        reserve_rows.append(
+            {
+                "date": day,
+                "block": block,
+                "symbol": item["symbol"],
+                "underlying_asset": item["underlyingAsset"].lower(),
+                "decimals": int(item["decimals"]),
+                "ltv": raw_bps_to_fraction(int(item["baseLTVasCollateral"])),
+                "liquidation_threshold": raw_bps_to_fraction(int(item["reserveLiquidationThreshold"])),
+                "liquidation_bonus": _bonus_fraction(
+                    int(item["reserveLiquidationBonus"]), f"reserve {item['symbol']} on {day}"
+                ),
+                "usage_as_collateral_enabled": bool(item["usageAsCollateralEnabled"]),
+                "emode_id": int(emode["id"]) if emode else 0,
+            }
+        )
+    symbols = [row["symbol"] for row in reserve_rows]
+    if len(set(symbols)) != len(symbols):
+        raise ValueError(f"Duplicate reserve symbols on {day} (block {block}).")
+    if not reserve_rows:
+        raise ValueError(f"No reserves returned for {day} (block {block}).")
+
+    emode_rows = []
+    for item in sorted(data["emodeCategories"], key=lambda c: int(c["id"])):
+        emode_rows.append(
+            {
+                "date": day,
+                "block": block,
+                "emode_id": int(item["id"]),
+                "label": item["label"] or f"category_{item['id']}",
+                "ltv": raw_bps_to_fraction(int(item["ltv"])),
+                "liquidation_threshold": raw_bps_to_fraction(int(item["liquidationThreshold"])),
+                "liquidation_bonus": _bonus_fraction(
+                    int(item["liquidationBonus"]), f"eMode {item['id']} on {day}"
+                ),
+            }
+        )
+    _check_param_ranges(reserve_rows, f"reserves on {day}")
+    _check_param_ranges(emode_rows, f"eMode categories on {day}")
+    return reserve_rows, emode_rows
+
+
+def liquidation_row(item: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one ``liquidationCalls`` entity (raw amounts stay as digit strings)."""
+    collateral, principal = item["collateralReserve"], item["principalReserve"]
+    timestamp = int(item["timestamp"])
+    return {
+        "id": item["id"],
+        "tx_hash": str(item["txHash"]).lower(),
+        "action": item.get("action"),
+        "timestamp": timestamp,
+        "date": _utc_date_of(timestamp),
+        "user_id": item["user"]["id"],
+        "liquidator": str(item["liquidator"]).lower(),
+        "collateral_reserve_id": collateral["id"],
+        "collateral_symbol": collateral["symbol"],
+        "collateral_underlying_asset": collateral["underlyingAsset"].lower(),
+        "collateral_decimals": int(collateral["decimals"]),
+        "principal_reserve_id": principal["id"],
+        "principal_symbol": principal["symbol"],
+        "principal_underlying_asset": principal["underlyingAsset"].lower(),
+        "principal_decimals": int(principal["decimals"]),
+        "collateral_amount": str(item["collateralAmount"]),
+        "principal_amount": str(item["principalAmount"]),
+        "collateral_asset_price_usd": item["collateralAssetPriceUSD"],
+        "borrow_asset_price_usd": item["borrowAssetPriceUSD"],
+    }
+
+
+def repay_row(item: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one ``repays`` entity (``user`` is the debtor, ``repayer`` the payer)."""
+    reserve = item["reserve"]
+    timestamp = int(item["timestamp"])
+    return {
+        "id": item["id"],
+        "tx_hash": str(item["txHash"]).lower(),
+        "action": item.get("action"),
+        "timestamp": timestamp,
+        "date": _utc_date_of(timestamp),
+        "user_id": item["user"]["id"],
+        "repayer_id": item["repayer"]["id"],
+        "reserve_id": reserve["id"],
+        "reserve_symbol": reserve["symbol"],
+        "underlying_asset": reserve["underlyingAsset"].lower(),
+        "decimals": int(reserve["decimals"]),
+        "amount": str(item["amount"]),
+        "asset_price_usd": item["assetPriceUSD"],
+        "use_a_tokens": bool(item["useATokens"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# File helpers
+# ---------------------------------------------------------------------------
+
+
+def _tmp_path(path: Path) -> Path:
+    """Return the temporary sibling used for atomic writes."""
+    return path.with_name(path.name + ".tmp")
+
+
+def _write_frame(frame: pd.DataFrame, path: Path, compression: str | None = None) -> None:
+    """Write ``frame`` to ``path`` atomically (temporary file, then rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _tmp_path(path)
+    frame.to_csv(tmp, index=False, compression=compression)
+    os.replace(tmp, path)
+
+
+def _write_json(payload: dict[str, Any], path: Path) -> None:
+    """Write ``payload`` as JSON atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _tmp_path(path)
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    """Read a JSON object, or ``{}`` if the file is missing or unreadable."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _csv_text(value: Any) -> str:
+    """Format one parameter cell as text (booleans lowercase, as the loader expects)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def upsert_param_rows(
+    path: Path,
+    rows: list[dict[str, Any]],
+    columns: list[str],
+    key: list[str],
+) -> None:
+    """Merge ``rows`` into the parameter CSV at ``path``, de-duplicating on ``key``.
+
+    Existing rows with the same key are replaced by the new ones. Cells are kept
+    as text so values already on disk are never reformatted. The result is
+    sorted by date (stable) and written atomically.
+    """
+    new = pd.DataFrame([{c: _csv_text(r[c]) for c in columns} for r in rows], columns=columns)
+    if path.is_file():
+        old = pd.read_csv(path, dtype=str, keep_default_na=False)
+        combined = pd.concat([old.reindex(columns=columns, fill_value=""), new], ignore_index=True)
+    else:
+        combined = new
+    combined = combined.drop_duplicates(subset=key, keep="last")
+    combined = combined.sort_values("date", kind="stable").reset_index(drop=True)
+    _write_frame(combined, path)
+
+
+# ---------------------------------------------------------------------------
+# Daily snapshots
+# ---------------------------------------------------------------------------
+
+
+def positions_path(scenario_dir: Path, day: str) -> Path:
+    """Return the positions file of ``day`` (its existence is the day's checkpoint)."""
+    return scenario_dir / DAILY_DIR / f"positions_{day}.csv.gz"
+
+
+def extract_day(
+    client: GraphClient,
+    scenario_dir: Path,
+    day: str,
+    block: int,
+) -> dict[str, Any]:
+    """Fetch and write the snapshot of one day at one block.
+
+    Everything is fetched and validated in memory first. Reserve and eMode
+    parameters are written before the positions file, because the positions
+    file is the checkpoint that marks the day as done.
 
     Returns
     -------
     dict
-        Consolidated payload with metadata, users, and liquidation calls.
+        Per-day metadata: ``block``, ``users`` (borrowers returned), ``rows``,
+        ``stable_debt_rows``, ``graph_requests`` and ``extracted_at_utc``.
     """
-    start_timestamp, end_ts = _window_bounds(end_timestamp)
-    start_iso = datetime.fromtimestamp(start_timestamp, tz=timezone.utc).isoformat()
-    end_iso = datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat()
+    requests_before = client.request_count
+    params = client.query(RESERVES_QUERY, {"block": block})
+    reserve_rows, emode_rows = build_param_rows(params, day, block)
 
-    logger.info(
-        "Extracting Aave v3 30-day history from %s to %s.",
-        start_iso,
-        end_iso,
-    )
-
-    try:
-        with requests.Session() as session:
-            users = _paginate_entity(
-                USERS_QUERY,
-                "users",
-                start_timestamp,
-                end_ts,
-                session,
-            )
-            liquidation_calls = _paginate_entity(
-                LIQUIDATION_CALLS_QUERY,
-                "liquidationCalls",
-                start_timestamp,
-                end_ts,
-                session,
-            )
-    except GraphAPIError:
-        logger.exception(
-            "Unable to extract Aave v3 history ending at timestamp %s.",
-            end_timestamp,
+    n_users = 0
+    rows: list[dict[str, Any]] = []
+    stable_rows = 0
+    for page in client.paginate(USERS_SNAPSHOT_QUERY, "users", {"block": block}):
+        page_rows, page_stable_rows = flatten_users(page, day, block)
+        n_users += len(page)
+        rows.extend(page_rows)
+        stable_rows += page_stable_rows
+    if not n_users:
+        raise GraphAPIError(f"No borrowers returned for {day} (block {block}).")
+    if stable_rows:
+        logger.warning(
+            "%s: %s rows with non-zero stable debt (stored value may be stale).", day, stable_rows
         )
-        raise
 
-    payload: dict[str, Any] = {
-        "protocol": "aave-v3",
-        "network": "ethereum",
-        "subgraph_id": AAVE_V3_ETHEREUM_SUBGRAPH_ID,
-        "window_days": WINDOW_DAYS,
-        "start_timestamp": start_timestamp,
-        "end_timestamp": end_ts,
-        "start_datetime_utc": start_iso,
-        "end_datetime_utc": end_iso,
-        "extracted_at_utc": datetime.now(timezone.utc).isoformat(),
-        "user_count": len(users),
-        "liquidation_call_count": len(liquidation_calls),
-        "users": users,
-        "liquidationCalls": liquidation_calls,
+    protocol_dir = scenario_dir / PROTOCOL_DIR
+    upsert_param_rows(
+        protocol_dir / RESERVE_PARAMS_FILE, reserve_rows, RESERVE_PARAM_COLUMNS, RESERVE_PARAM_KEY
+    )
+    if emode_rows:
+        upsert_param_rows(
+            protocol_dir / EMODE_CATEGORIES_FILE, emode_rows, EMODE_COLUMNS, EMODE_KEY
+        )
+    _write_frame(
+        pd.DataFrame(rows, columns=POSITION_COLUMNS),
+        positions_path(scenario_dir, day),
+        compression="gzip",
+    )
+    return {
+        "block": block,
+        "users": n_users,
+        "rows": len(rows),
+        "stable_debt_rows": stable_rows,
+        "graph_requests": client.request_count - requests_before,
+        "extracted_at_utc": _now_utc(),
     }
 
+
+def _derive_day_metadata(path: Path) -> dict[str, Any]:
+    """Rebuild a day's metadata from an existing positions file."""
+    frame = pd.read_csv(path, usecols=["block", "user_id"], dtype={"user_id": str})
+    return {
+        "block": int(frame["block"].iloc[0]) if len(frame) else None,
+        "users": int(frame["user_id"].nunique()),
+        "rows": int(len(frame)),
+        "derived_from_file": True,
+        "extracted_at_utc": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(
+            timespec="seconds"
+        ),
+    }
+
+
+def _write_daily_metadata(
+    scenario: Scenario, scenario_dir: Path, days: dict[str, dict[str, Any]]
+) -> None:
+    """Write ``thegraph_daily/metadata.json`` for all days known so far."""
+    ordered = {day: days[day] for day in sorted(days)}
+    payload = {
+        "subgraph_id": AAVE_V3_ETHEREUM_SUBGRAPH_ID,
+        "scenario": scenario.folder,
+        "first_date": next(iter(ordered), None),
+        "last_date": next(reversed(ordered), None),
+        "n_days": len(ordered),
+        "balance_formula": "rayMul(scaled balance, reserve index at the snapshot block)",
+        "extraction_timestamp_utc": _now_utc(),
+        "days": ordered,
+    }
+    _write_json(payload, scenario_dir / DAILY_DIR / METADATA_FILE)
+
+
+def extract_positions(
+    client: GraphClient,
+    scenario: Scenario,
+    start: str,
+    end: str,
+    out_root: Path,
+) -> list[str]:
+    """Extract the daily snapshots of ``[start, end]`` for one scenario.
+
+    Days whose positions file already exists are skipped. A day that fails after
+    all retries is logged and skipped; the run aborts after
+    ``MAX_CONSECUTIVE_DAY_FAILURES`` failures in a row or on a fatal error.
+
+    Returns
+    -------
+    list[str]
+        Dates that failed (empty when everything succeeded).
+    """
+    scenario_dir = out_root / scenario.folder
+    days = [d.isoformat() for d in _date_range(start, end)]
+    pending = [d for d in days if not positions_path(scenario_dir, d).is_file()]
     logger.info(
-        "Extracted %s borrowers and %s liquidation calls.",
-        len(users),
-        len(liquidation_calls),
+        "%s: %s days in [%s, %s], %s already done, %s to fetch.",
+        scenario.folder,
+        len(days),
+        start,
+        end,
+        len(days) - len(pending),
+        len(pending),
     )
 
-    if output_path is not None:
-        save_history_json(payload, output_path)
+    metadata_path = scenario_dir / DAILY_DIR / METADATA_FILE
+    day_meta: dict[str, dict[str, Any]] = dict(_read_json(metadata_path).get("days", {}))
+    derived = False
+    for day in days:
+        if day not in pending and day not in day_meta:
+            day_meta[day] = _derive_day_metadata(positions_path(scenario_dir, day))
+            derived = True
 
-    return payload
+    failed: list[str] = []
+    if pending:
+        blocks = daily_blocks(
+            pending[0], pending[-1], cache_path=scenario_dir / PROTOCOL_DIR / BLOCKS_FILE
+        ).set_index("date")["block"]
+        consecutive = 0
+        for position, day in enumerate(pending, start=1):
+            block = int(blocks[day])
+            t0 = time.perf_counter()
+            try:
+                day_meta[day] = extract_day(client, scenario_dir, day, block)
+            except GraphFatalError:
+                _write_daily_metadata(scenario, scenario_dir, day_meta)
+                raise
+            except (GraphAPIError, ValueError) as exc:
+                logger.error("%s: day failed (block %s): %s", day, block, exc)
+                failed.append(day)
+                consecutive += 1
+                if consecutive >= MAX_CONSECUTIVE_DAY_FAILURES:
+                    _write_daily_metadata(scenario, scenario_dir, day_meta)
+                    raise GraphAPIError(
+                        f"{consecutive} consecutive day failures; aborting. Failed: {failed}"
+                    ) from exc
+                continue
+            consecutive = 0
+            info = day_meta[day]
+            logger.info(
+                "%s (%s/%s) block %s: %s borrowers, %s rows, %s requests, %.1fs.",
+                day,
+                position,
+                len(pending),
+                block,
+                info["users"],
+                info["rows"],
+                info["graph_requests"],
+                time.perf_counter() - t0,
+            )
+            _write_daily_metadata(scenario, scenario_dir, day_meta)
+
+    if derived and not pending:
+        _write_daily_metadata(scenario, scenario_dir, day_meta)
+    return failed
 
 
-def run_extraction() -> None:
-    """Extract 30-day Aave v3 history for the baseline and stress scenarios."""
+def validate_protocol_files(scenario: Scenario, out_root: Path) -> None:
+    """Load both parameter files with ``src.utils.protocol_params`` as a final check.
+
+    Raises
+    ------
+    ValueError
+        If either file fails the loader's validation.
+    """
+    reserves = load_reserve_params(scenario.folder, raw_dir=out_root)
+    emodes = load_emode_categories(scenario.folder, raw_dir=out_root)
+    logger.info(
+        "%s: protocol files validated (%s reserve rows over %s dates, %s eMode rows).",
+        scenario.folder,
+        len(reserves),
+        reserves["date"].nunique(),
+        len(emodes),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Events
+# ---------------------------------------------------------------------------
+
+
+def _fetch_events(
+    client: GraphClient,
+    query: str,
+    entity: str,
+    to_row: Any,
+    t0: int,
+    t1: int,
+    columns: list[str],
+) -> pd.DataFrame:
+    """Fetch every ``entity`` event with ``t0 <= timestamp < t1`` as a sorted table."""
+    rows: dict[str, dict[str, Any]] = {}
+    for page in client.paginate(query, entity, {"t0": t0, "t1": t1}):
+        for item in page:
+            rows[item["id"]] = to_row(item)
+    frame = pd.DataFrame(list(rows.values()), columns=columns)
+    return frame.sort_values(["timestamp", "id"], kind="stable").reset_index(drop=True)
+
+
+def extract_events(
+    client: GraphClient,
+    scenario: Scenario,
+    start: str,
+    end: str,
+    out_root: Path,
+) -> dict[str, int]:
+    """Extract liquidation calls and repays with timestamps in ``[start, end + 1 day)``.
+
+    The window is recorded in ``thegraph_events/metadata.json``; if both CSVs
+    exist for exactly the same window, nothing is fetched. Otherwise both files
+    are rebuilt.
+
+    Returns
+    -------
+    dict
+        Row counts: ``liquidation_calls`` and ``repays``.
+    """
+    events_dir = out_root / scenario.folder / EVENTS_DIR
+    t0 = _utc_midnight_ts(_parse_date(start))
+    t1 = _utc_midnight_ts(_parse_date(end) + timedelta(days=1))
+    liquidations_path, repays_path = events_dir / LIQUIDATIONS_FILE, events_dir / REPAYS_FILE
+    metadata_path = events_dir / METADATA_FILE
+
+    previous = _read_json(metadata_path)
+    if (
+        liquidations_path.is_file()
+        and repays_path.is_file()
+        and previous.get("start_timestamp") == t0
+        and previous.get("end_timestamp") == t1
+    ):
+        logger.info("%s: events for [%s, %s] already extracted; skipping.", scenario.folder, start, end)
+        return {k: int(previous.get(k, 0)) for k in ("liquidation_calls", "repays")}
+
+    liquidations = _fetch_events(
+        client, LIQUIDATIONS_QUERY, "liquidationCalls", liquidation_row, t0, t1, LIQUIDATION_COLUMNS
+    )
+    repays = _fetch_events(client, REPAYS_QUERY, "repays", repay_row, t0, t1, REPAY_COLUMNS)
+    _write_frame(liquidations, liquidations_path)
+    _write_frame(repays, repays_path)
+    _write_json(
+        {
+            "subgraph_id": AAVE_V3_ETHEREUM_SUBGRAPH_ID,
+            "scenario": scenario.folder,
+            "window_start": start,
+            "window_end_inclusive": end,
+            "start_timestamp": t0,
+            "end_timestamp": t1,
+            "liquidation_calls": len(liquidations),
+            "repays": len(repays),
+            "extraction_timestamp_utc": _now_utc(),
+            "note": "USD price fields come from the subgraph and are 0 in 20-27% of liquidations; do not use.",
+        },
+        metadata_path,
+    )
+    logger.info(
+        "%s: %s liquidation calls and %s repays in [%s, %s].",
+        scenario.folder,
+        len(liquidations),
+        len(repays),
+        start,
+        end,
+    )
+    return {"liquidation_calls": len(liquidations), "repays": len(repays)}
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse and validate command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Extract daily Aave v3 time-travel snapshots, reserve parameters and events."
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=["baseline", "stress", "all"],
+        default="all",
+        help="Scenario window to extract (default: all).",
+    )
+    parser.add_argument("--start", help="Override window start, YYYY-MM-DD (needs --end).")
+    parser.add_argument("--end", help="Override window end, YYYY-MM-DD (needs --start).")
+    parser.add_argument(
+        "--out-root",
+        type=Path,
+        default=RAW_DATA_DIR,
+        help="Root folder that holds the scenario folders (default: data/01_raw).",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--events-only", action="store_true", help="Only extract the events.")
+    mode.add_argument(
+        "--positions-only",
+        action="store_true",
+        help="Only extract daily positions and reserve parameters.",
+    )
+    args = parser.parse_args(argv)
+    if (args.start is None) != (args.end is None):
+        parser.error("--start and --end must be given together.")
+    if args.start is not None:
+        if args.scenario == "all":
+            parser.error("--start/--end need a single --scenario (baseline or stress).")
+        try:
+            _date_range(args.start, args.end)
+        except ValueError as exc:
+            parser.error(str(exc))
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the extraction for the selected scenarios and return the exit code."""
+    args = _parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
-    ensure_raw_scenario_directories()
+    names = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
+    started = time.perf_counter()
+    failures: dict[str, list[str]] = {}
 
-    scenarios: list[tuple[str, datetime, Path]] = [
-        ("baseline", BASELINE_END, BASELINE_DIR / "thegraph_hf_30d.json"),
-        ("stress", STRESS_END, STRESS_DIR / "thegraph_hf_30d.json"),
-    ]
-
-    for name, end_dt, output_path in scenarios:
-        end_timestamp = int(end_dt.timestamp())
-        logger.info(
-            "Starting %s extraction (end_timestamp=%s, %s).",
-            name,
-            end_timestamp,
-            end_dt.isoformat(),
-        )
-        try:
-            fetch_30d_history(end_timestamp, output_path=output_path)
-        except (GraphAPIError, ValueError, requests.RequestException) as exc:
-            logger.error("Failed to extract %s scenario: %s", name, exc)
-            raise
+    try:
+        with GraphClient() as client:
+            for name in names:
+                scenario = SCENARIOS[name]
+                start = args.start or scenario.start
+                end = args.end or scenario.end
+                if not args.events_only:
+                    failed = extract_positions(client, scenario, start, end, args.out_root)
+                    if failed:
+                        failures[scenario.folder] = failed
+                    try:
+                        validate_protocol_files(scenario, args.out_root)
+                    except (ValueError, FileNotFoundError) as exc:
+                        logger.error("%s: protocol file validation failed: %s", scenario.folder, exc)
+                        failures.setdefault(scenario.folder, []).append("protocol_files")
+                if not args.positions_only:
+                    extract_events(client, scenario, start, end, args.out_root)
+            logger.info(
+                "Done in %.1f min: %s Graph requests (%s answered queries).",
+                (time.perf_counter() - started) / 60,
+                client.request_count,
+                client.query_count,
+            )
+    except GraphAPIError as exc:
+        logger.error("Aborted: %s. Completed days are kept; rerun the same command to resume.", exc)
+        return 1
+    if failures:
+        logger.error("Incomplete extraction, rerun to retry: %s", failures)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    run_extraction()
+    sys.exit(main())
