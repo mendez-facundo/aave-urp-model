@@ -19,10 +19,25 @@ La censura por la derecha es la de las wallets cuyo desenlace no se observa: sig
 **2026-10-11 · No se cuentan transiciones a través de días no observados.**
 El forward-fill en los gaps fabricaba transiciones de permanencia.
 
+**2026-10-12 · Un `liquidationCall` del día d lleva a S7 en el snapshot de d+1 (calibración causal).**
+Los snapshots son de las 00:00 UTC, así que un evento fechado d ocurre entre el snapshot d y el d+1: se asocia a la transición d → d+1 (`LIQUIDATION_DAY_OFFSET = 0`) y la wallet es S7 en d+1, donde el HF ya está restaurado. Los repagos se leen igual (S1 se define por la deuda del snapshot siguiente). Consecuencia: la calibración [t−30, t] solo usa información hasta el snapshot de t; las liquidaciones del propio día t (en stress, el crash del 2024-08-05) caen en el período out-of-time. En `hf_at_s7_entry`, una entrada por `liquidationCall` lleva el HF del snapshot anterior (> 1) y el LGD la trata con HF_entry = 1 usando `s7_trigger`. *Origen: revisión del coordinador (12/10); alternativa "mismo día" disponible con `LIQUIDATION_DAY_OFFSET = 1`.*
+
+**2026-10-12 · Un repago que cierra la posición (S1) cierra un *spell*; un nuevo endeudamiento dentro de la ventana abre un spell nuevo.**
+El spell nuevo es una trayectoria nueva y cuenta como ingreso tardío desde su día de reingreso (`spell_id` interno). Después de S7 la wallet no se vuelve a seguir dentro de la ventana (regla del proyecto): sus observaciones posteriores se ignoran para N y se informa cuántas son. El bootstrap sigue remuestreando wallets, así que los spells de una wallet quedan juntos. *Origen: revisión del coordinador (12/10).*
+
+**2026-10-12 · Umbral de polvo para S1: `DUST_DEBT_USD` = USD 1.**
+S1 = un evento `repay` tras el cual la deuda total del usuario es ≤ USD 1 en el snapshot siguiente, o el usuario desaparece de ese snapshot habiendo tenido un `repay` ese día. Una deuda residual entre USD 1 y el mínimo del panel no es S1: la wallet sale del filtro (censura por salida del filtro). *Origen: confirmación del usuario (12/10).*
+
 ## Datos
 
 **2026-10-11 · El panel de Markov se construye con snapshots diarios con time-travel de The Graph** (`block: {number: B}`), uno por día de `[t−30, t+30]`.
 El extractor anterior devolvía posiciones de 2026 (ver `docs/findings_graph_extraction.md`). El tramo `(t, t+30]` es para la validación out-of-time.
+
+**2026-10-12 · Los wrappers de stablecoins con rendimiento (sDAI, sUSDe) cuentan como colateral estable.**
+Entran en la regla del resto de los perfiles (A: estables o WBTC; B: estables, WETH, LST o WBTC) y en `stable_usd`, valuados al precio del oráculo. No son stablecoins de deuda: la regla de deuda 100% en stablecoins USD no los incluye. *Origen: revisión del coordinador (12/10).*
+
+**2026-10-12 · Deuda mínima de USD 100 para entrar al panel de perfiles.**
+Un usuario-día entra al panel solo si su deuda total es ≥ USD 100: las wallets con HF ≤ 1 persistente eran casi todas polvo que los liquidadores ignoran (ninguna superaba USD 941 de deuda en el diagnóstico de la Fase 1). Como sensibilidad, el 02 (§17.5) reporta N y PD a 30 días por estado con un mínimo de USD 1.000, usando las mismas funciones. *Origen: confirmación del usuario (12/10), a partir del diagnóstico de la Fase 1.*
 
 **2026-10-11 · Los precios para el HF salen del oráculo de Aave** (`AaveOracle.getAssetsPrices`, un `eth_call` por bloque diario).
 Es el precio que usa el protocolo para liquidar, y resuelve la valuación de los LST (Binance no lista wstETH, rETH ni cbETH). Binance se mantiene para EVT.
