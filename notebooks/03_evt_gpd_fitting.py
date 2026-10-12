@@ -32,16 +32,18 @@
 # 5. Goodness of fit: **Q-Q plot** and **Anderson-Darling** $A^2$ test with a parametric-bootstrap p-value.
 # 6. Closed-form $VaR_{0.99}$ and $ES_{0.99}$, plus a **bootstrap 95% confidence interval** for $ES_{0.99}$.
 # 7. One consolidated parameter table per scenario ($u^*$, $\xi$, $\sigma$, $ES_{0.99}$).
+# 8. Extensions on the fitted tail: $ES_p$ at $p \in \{0.99, 0.995, 0.999\}$ (Section 16), the ES of the $h$-day loss by Monte Carlo (Section 17), and the **break-even price shocks** implied by the real Aave parameters (Sections 18-19).
 #
 # Unless stated otherwise, all risk measures are expressed in **daily log-loss units** (e.g. $0.10$ means a daily log-return of $-0.10$).
 #
-# This notebook is strictly for **exploratory analysis and stochastic validation**: it reads the raw price extracts and keeps every result in memory, without persisting any output to disk.
+# This notebook is strictly for **exploratory analysis and stochastic validation**: it reads the raw price extracts and the Aave reserve parameters, and keeps every result in memory. The only files it writes are the manual test dumps of Sections 20-21 (`*_not_for_prod.csv`).
 
 # %% [markdown]
 # ## 1. Imports and configuration
 
 # %%
 import logging
+import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,8 +53,22 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from IPython.display import display
-from scipy import stats
-from scipy.stats import genpareto
+from matplotlib.ticker import PercentFormatter
+
+sys.path.append(str(Path("..").resolve()))  # project root, so that ``src.utils`` is importable from notebooks/
+from src.utils.protocol_params import get_param, load_reserve_params  # noqa: E402
+
+try:
+    from scipy import stats
+    from scipy.stats import genpareto
+
+    STATS_BACKEND: str = "scipy.stats"
+except ImportError:
+    # Windows Application Control can block a scipy DLL that scipy.stats needs (see src/utils/stats_compat.py).
+    from src.utils import stats_compat as stats
+    from src.utils.stats_compat import genpareto
+
+    STATS_BACKEND = stats.BACKEND_NAME
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,7 +125,7 @@ XI_ZERO_TOL: float = 1e-8
 CDF_CLIP: float = 1e-12
 
 SCENARIO_COLORS: dict[str, str] = {"baseline": "#1f77b4", "stress": "#d62728"}
-RNG_STAGES: dict[str, int] = {"anderson_darling": 0, "es_bootstrap": 1}
+RNG_STAGES: dict[str, int] = {"anderson_darling": 0, "es_bootstrap": 1, "horizon_mc": 2}
 
 
 def make_rng(scenario_key: str, asset: str, stage: str) -> np.random.Generator:
@@ -122,37 +138,42 @@ def make_rng(scenario_key: str, asset: str, stage: str) -> np.random.Generator:
 print(f"Scenarios: {SCENARIOS} | Assets: {ASSETS}")
 print(f"Confidence level p = {CONFIDENCE_LEVEL} | Threshold band (loss quantiles) = {THRESHOLD_BAND}")
 print(f"Bootstrap replicates: ES = {N_BOOTSTRAP_ES}, Anderson-Darling = {N_BOOTSTRAP_AD}")
+print(f"Statistics backend: {STATS_BACKEND}")
 
 # %% [markdown]
 # ## 2. Market data ingestion
 #
-# For each scenario folder, the four Binance daily extracts (`binance_prices_{eth,btc,uni,link}.csv`) are loaded and only the **close** price is kept. Each series is validated before use:
+# For each scenario folder, the single long-format Binance extract `prices/binance_daily.csv` (columns `date`, `ticker`, `timestamp`, `open`, `high`, `low`, `close`, `volume`; one row per day and ticker, e.g. `ETHUSDT`) is loaded. Only the **close** price is kept: the rows are validated per ticker and then pivoted to one column per asset, which is split into one series per asset (ETH, BTC, UNI, LINK). Each series is validated before use:
 #
-# - required columns (`date`, `close`) are present;
-# - dates are unique and sorted;
+# - required columns (`date`, `ticker`, `close`) are present, and every expected ticker (`{asset}USDT`) is in the file;
+# - dates are unique per ticker and sorted;
 # - close prices are strictly positive (a requirement of the logarithm);
 # - calendar gaps are reported, because a log return across a gap would aggregate more than one day of risk.
+#
+# Intraday data are not used for EVT (see `docs/decisions.md`), and the per-ticker extracts (`binance_prices_*.csv`) are kept on disk but no longer read.
 
 # %%
-REQUIRED_PRICE_COLUMNS: tuple[str, ...] = ("date", "close")
+BINANCE_DAILY_FILE: str = "prices/binance_daily.csv"
+BINANCE_QUOTE: str = "USDT"
+REQUIRED_PRICE_COLUMNS: tuple[str, ...] = ("date", "ticker", "close")
 
 
-def load_close_prices(scenario_dir: Path, asset: str) -> pd.Series:
-    """Load and validate the Binance daily close series of one asset.
+def load_close_prices(scenario_dir: Path, assets: list[str]) -> dict[str, pd.Series]:
+    """Load and validate the Binance daily close series of several assets from the long-format extract.
 
     Args:
         scenario_dir: Scenario folder under ``data/01_raw``.
-        asset: Asset ticker, e.g. ``"ETH"``.
+        assets: Asset tickers without quote currency, e.g. ``["ETH", "BTC"]``.
 
     Returns:
-        Close prices indexed by calendar date and named after the asset.
+        Close prices of each asset, indexed by calendar date and named after the asset.
 
     Raises:
         FileNotFoundError: If the CSV extract does not exist.
-        ValueError: If required columns are missing, dates are duplicated,
-            or close prices are missing or non-positive.
+        ValueError: If required columns or tickers are missing, dates are duplicated within
+            a ticker, or close prices are missing or non-positive.
     """
-    csv_path = scenario_dir / f"binance_prices_{asset.lower()}.csv"
+    csv_path = scenario_dir / BINANCE_DAILY_FILE
     if not csv_path.exists():
         raise FileNotFoundError(f"Price extract not found: {csv_path.resolve()}")
 
@@ -161,21 +182,32 @@ def load_close_prices(scenario_dir: Path, asset: str) -> pd.Series:
     if missing_columns:
         raise ValueError(f"{csv_path.name} is missing columns: {sorted(missing_columns)}")
 
-    frame = frame.loc[:, list(REQUIRED_PRICE_COLUMNS)].copy()
-    frame["date"] = pd.to_datetime(frame["date"])
-    frame = frame.sort_values("date")
+    ticker_to_asset = {f"{asset}{BINANCE_QUOTE}": asset for asset in assets}
+    missing_tickers = sorted(set(ticker_to_asset) - set(frame["ticker"]))
+    if missing_tickers:
+        raise ValueError(f"{csv_path.name} is missing tickers: {missing_tickers}")
 
-    if frame["date"].duplicated().any():
+    frame = frame.loc[frame["ticker"].isin(ticker_to_asset), list(REQUIRED_PRICE_COLUMNS)].copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame["asset"] = frame["ticker"].map(ticker_to_asset)
+    frame = frame.sort_values(["asset", "date"])
+
+    if frame.duplicated(["asset", "date"]).any():
         raise ValueError(f"{csv_path.name} contains duplicated dates")
     if frame["close"].isna().any() or (frame["close"] <= 0).any():
         raise ValueError(f"{csv_path.name} contains missing or non-positive close prices")
 
-    gap_days = frame["date"].diff().dt.days.dropna()
-    n_gaps = int((gap_days != 1).sum())
-    if n_gaps:
-        logger.warning("%s: %d calendar gaps detected; affected returns span several days", csv_path, n_gaps)
+    for asset, group in frame.groupby("asset"):
+        n_gaps = int((group["date"].diff().dt.days.dropna() != 1).sum())
+        if n_gaps:
+            logger.warning(
+                "%s [%s]: %d calendar gaps detected; affected returns span several days", csv_path, asset, n_gaps
+            )
 
-    return frame.set_index("date")["close"].rename(asset)
+    wide = frame.pivot(index="date", columns="asset", values="close").sort_index()
+    if wide.isna().any().any():
+        logger.warning("%s: tickers do not share the same calendar dates; each series keeps its own dates", csv_path)
+    return {asset: wide[asset].dropna().rename(asset) for asset in assets}
 
 
 close_prices: dict[str, dict[str, pd.Series]] = {}
@@ -183,7 +215,7 @@ for folder_name in SCENARIO_DIRS:
     scenario_key = SCENARIO_KEY[folder_name]
     scenario_dir = RAW_DATA_DIR / folder_name
     print(f"[{scenario_key}] {scenario_dir.resolve()}")
-    close_prices[scenario_key] = {asset: load_close_prices(scenario_dir, asset) for asset in ASSETS}
+    close_prices[scenario_key] = load_close_prices(scenario_dir, ASSETS)
 
 price_coverage_df = pd.DataFrame(
     [
@@ -1142,7 +1174,507 @@ display(comparison_df.style.format(precision=4).set_caption("Side-by-side tail p
 # - **Threshold-selection uncertainty** is not propagated into the ES interval.
 
 # %% [markdown]
-# ## 16. Manual export of $ES_{0.99}$ collateral shocks (test dump, not for production)
+# ## 16. Expected Shortfall at higher confidence levels ($p$ = 0.99, 0.995, 0.999)
+#
+# Sections 11-12 report $ES_{0.99}$. With the fitted model unchanged ($u^*$, $\hat\xi$, $\hat\sigma$, $\zeta_u$), this section reports, for $p \in \{0.99, 0.995, 0.999\}$, the daily $VaR_p$, the daily $ES_p$ (log-loss units) and the arithmetic price shock $\mathbb{E}[1 - e^{-X} \mid X > VaR_p]$, reusing `gpd_value_at_risk`, `gpd_expected_shortfall` and `gpd_expected_price_drop` of Section 11.
+#
+# The 95% interval of $ES_p$ is the bootstrap of Section 12 (`bootstrap_expected_shortfall`, same $B$ = `N_BOOTSTRAP_ES`, same random stream `es_bootstrap`). The $B$ replicates $(\xi^*_b, \sigma^*_b)$ stored in `bootstrap_replicates` are re-evaluated with the closed-form $ES_p$ at each level; this is identical to calling `bootstrap_expected_shortfall` again with the same stream for each $p$ (the resamples and refits do not depend on $p$), without repeating the MLE refits. The replicates are therefore paired across levels, and the $p = 0.99$ rows must reproduce Sections 11-12 exactly; the cell below checks it. The interval refers to `es` (log-loss units), not to the price shock.
+#
+# **$p = 0.999$ is an out-of-sample extrapolation.** The return period of a $p$-level daily loss is $1/(1-p)$ days: 100 days for $p$ = 0.99, 200 for 0.995 and **1,000 for 0.999, which exceeds the 730 observations of each window** (the expected number of sample days beyond $VaR_{0.999}$ is 0.73). The figure rests entirely on the GPD shape $\hat\xi$ extrapolated beyond the data and cannot be checked against history. The bootstrap interval only captures the sampling error of $(\hat\xi, \hat\sigma)$ **given** that the GPD form holds, so it understates the model risk at this level. The column `out_of_sample` is `True` when the return period exceeds the number of observations, and the rows are shaded.
+
+# %%
+ES_LEVELS: tuple[float, ...] = (0.99, 0.995, 0.999)
+if CONFIDENCE_LEVEL not in ES_LEVELS:
+    raise ValueError(f"ES_LEVELS {ES_LEVELS} must include CONFIDENCE_LEVEL = {CONFIDENCE_LEVEL}")
+
+
+def return_period_days(p: float, horizon_days: int = 1) -> float:
+    """Mean number of days between two exceedances of VaR_p of the h-day loss, h / (1 - p)."""
+    return horizon_days / (1.0 - p)
+
+
+def is_out_of_sample(p: float, n_obs: int, horizon_days: int = 1) -> bool:
+    """Flag a risk level whose return period exceeds the number of daily observations of the window."""
+    return return_period_days(p, horizon_days) > n_obs
+
+
+def bootstrap_es_at_level(model: TailModel, replicates: pd.DataFrame, p: float) -> pd.Series:
+    """ES_p of every bootstrap replicate of Section 12; failed fits and replicates with xi* >= 1 stay NaN."""
+    es_at_level = pd.Series(np.nan, index=replicates.index, name="es")
+    for b in replicates.index[replicates["es"].notna()]:
+        es_at_level[b] = gpd_expected_shortfall(
+            model.selection.threshold, replicates.at[b, "xi"], replicates.at[b, "sigma"], model.zeta_u, p
+        )
+    return es_at_level
+
+
+ci_alpha = 1.0 - CI_LEVEL
+multilevel_rows: list[dict[str, object]] = []
+for scenario_key in SCENARIOS:
+    for asset in ASSETS:
+        model = tail_models[scenario_key][asset]
+        for level in ES_LEVELS:
+            params = (model.selection.threshold, model.fit.xi, model.fit.sigma, model.zeta_u, level)
+            valid_es = bootstrap_es_at_level(model, bootstrap_replicates[scenario_key][asset], level).dropna()
+            if valid_es.size < 0.95 * N_BOOTSTRAP_ES:
+                logger.warning(
+                    "[%s] %s p=%s: only %d/%d valid ES bootstrap replicates",
+                    scenario_key, asset, level, valid_es.size, N_BOOTSTRAP_ES,
+                )
+            multilevel_rows.append(
+                {
+                    "scenario": scenario_key,
+                    "asset": asset,
+                    "confidence_level": level,
+                    "var": gpd_value_at_risk(*params),
+                    "es": gpd_expected_shortfall(*params),
+                    "es_ci_low": valid_es.quantile(ci_alpha / 2),
+                    "es_ci_high": valid_es.quantile(1.0 - ci_alpha / 2),
+                    "es_price_drop": gpd_expected_price_drop(*params),
+                    "return_period_days": return_period_days(level),
+                    "n_obs": model.n_obs,
+                    "out_of_sample": is_out_of_sample(level, model.n_obs),
+                }
+            )
+
+multilevel_df = pd.DataFrame(multilevel_rows).set_index(["scenario", "asset", "confidence_level"])
+
+# The p = 0.99 rows must reproduce Sections 11-12 (same model, same bootstrap stream).
+for scenario_key in SCENARIOS:
+    for asset in ASSETS:
+        reference = pd.concat(
+            [
+                risk_df.loc[(scenario_key, asset), ["var", "es", "es_price_drop"]],
+                bootstrap_summary_df.loc[(scenario_key, asset), ["es_ci_low", "es_ci_high"]],
+            ]
+        ).astype(float)
+        current = multilevel_df.loc[(scenario_key, asset, CONFIDENCE_LEVEL), reference.index].astype(float)
+        if not np.allclose(current, reference, rtol=1e-12, atol=0.0):
+            raise ValueError(f"[{scenario_key}] {asset}: p = {CONFIDENCE_LEVEL} row differs from Sections 11-12")
+print(f"p = {CONFIDENCE_LEVEL} rows reproduce Sections 11-12 (VaR, ES, price drop and bootstrap CI) for all scenarios and assets")
+
+out_of_sample_levels = sorted(
+    multilevel_df.index.get_level_values("confidence_level")[multilevel_df["out_of_sample"].to_numpy()].unique()
+)
+logger.warning(
+    "%d/%d (scenario, asset, p) rows are out-of-sample extrapolations (return period > n_obs): p = %s",
+    int(multilevel_df["out_of_sample"].sum()), len(multilevel_df), out_of_sample_levels,
+)
+
+
+def shade_out_of_sample(frame: pd.DataFrame) -> pd.DataFrame:
+    """Row-wise CSS that shades the out-of-sample rows of a Styler."""
+    css = np.where(frame["out_of_sample"].to_numpy()[:, None], "background-color: #fde0dd", "")
+    return pd.DataFrame(np.broadcast_to(css, frame.shape), index=frame.index, columns=frame.columns)
+
+
+display(
+    multilevel_df.style.format(precision=4)
+    .format({"es_price_drop": "{:.2%}", "return_period_days": "{:,.0f}"})
+    .apply(shade_out_of_sample, axis=None)
+    .set_caption(
+        f"GPD-POT VaR_p, ES_p (daily log-loss) and ES price shock; {CI_LEVEL:.0%} bootstrap CI of ES (B = {N_BOOTSTRAP_ES}); "
+        "shaded: out-of-sample extrapolation"
+    )
+)
+
+
+# %% [markdown]
+# ## 17. Expected Shortfall of the $h$-day loss (Monte Carlo)
+#
+# The collateral can keep falling between the liquidation trigger and the moment the position is closed. The loss over $h$ days is the sum of the daily log-losses, $X^{(h)} = \sum_{i=1}^{h} X_{t+i}$, and the matching arithmetic price shock is $1 - e^{-X^{(h)}}$. The sum of $h$ GPD-tailed variables has no closed form, so $VaR_p^{(h)}$, $ES_p^{(h)} = \mathbb{E}[X^{(h)} \mid X^{(h)} > VaR_p^{(h)}]$ and $\mathbb{E}[1 - e^{-X^{(h)}} \mid X^{(h)} > VaR_p^{(h)}]$ are obtained by simulation from the fitted daily model, for $h \in \{1, 2, 3, 5\}$ and $p \in \{0.99, 0.995\}$.
+#
+# **Daily model (semi-parametric, consistent with $\zeta_u$).** Each daily loss is drawn independently from the distribution that the POT estimator of Section 11 describes:
+#
+# - with probability $1 - \zeta_u$: a uniform draw from the **empirical** losses $X \le u^*$ (the body, which includes the days with gains);
+# - with probability $\zeta_u$: $u^* + Y$ with $Y \sim GPD(\hat\xi, \hat\sigma)$ (the tail).
+#
+# For $h = 1$ and $1 - p < \zeta_u$, the $p$-quantile and the tail mean of this mixture are the closed forms of Section 11, so the simulation must reproduce them up to Monte Carlo error. The second cell below checks it (all $|z| < $ `MC_CHECK_MAX_Z`).
+#
+# **Simulation.** `N_MC_PATHS` paths of 5 daily losses per (scenario, asset) with a fixed seed (stream `horizon_mc` of `make_rng`); the sums for $h$ = 1, 2, 3, 5 are partial sums of the same paths (common random numbers, so the differences between horizons are not blurred by sampling noise). The Monte Carlo standard error of $ES$ uses $ES = VaR + \mathbb{E}[(X - VaR)^+]/(1-p)$: it is the sample standard deviation of $VaR + (X - VaR)^+/(1-p)$ divided by $\sqrt{N}$, which accounts for the estimation of the VaR. Both columns `*_mc_se` quantify only the simulation error, not the estimation error of $(\hat\xi, \hat\sigma)$ (that is the bootstrap of Section 16 for $h = 1$).
+#
+# **The i.i.d. assumption understates multi-day risk.** As in the rest of the notebook, the daily losses are independent. Real crypto returns show **volatility clustering**: a large loss is followed by large losses more often than an i.i.d. draw would suggest, which fattens the tail of the $h$-day sum. The simulated $ES^{(h)}$ for $h > 1$ should therefore be read as a lower reference, not as a conservative figure; the conditional GARCH-EVT alternative is pending (`docs/decisions.md`). In addition, the body is resampled from the same window, so its sample drift (a negative mean loss in a rising market) slightly lowers the $h$-day sums.
+#
+# The return period of the $h$-day loss is $h/(1-p)$ days, and the `out_of_sample` flag uses the same rule as Section 16 (return period > number of daily observations): for $p = 0.995$, $h = 5$ the return period is 1,000 days.
+
+# %%
+HORIZONS_DAYS: tuple[int, ...] = (1, 2, 3, 5)
+HORIZON_LEVELS: tuple[float, ...] = (0.99, 0.995)
+N_MC_PATHS: int = 1_000_000
+MC_CHECK_MAX_Z: float = 4.0
+
+if N_MC_PATHS < 200_000:
+    raise ValueError(f"N_MC_PATHS = {N_MC_PATHS} is too small for stable ES estimates at p = {max(HORIZON_LEVELS)}")
+
+
+def simulate_daily_losses(
+    model: TailModel, loss: pd.Series, n_paths: int, n_days: int, rng: np.random.Generator
+) -> np.ndarray:
+    """Draw i.i.d. daily losses from the empirical body below u* plus the fitted GPD tail above u*.
+
+    Args:
+        model: Fitted tail model; supplies u*, (xi, sigma) and zeta_u.
+        loss: Daily log-losses of the window, whose values <= u* form the empirical body.
+        n_paths: Number of simulated paths.
+        n_days: Number of consecutive days per path.
+        rng: Random generator.
+
+    Returns:
+        Array of shape (n_paths, n_days).
+
+    Raises:
+        ValueError: If the body and the exceedances do not add up to the sample size.
+    """
+    values = loss.to_numpy()
+    threshold = model.selection.threshold
+    body = values[values <= threshold]
+    if body.size + model.fit.n_exceedances != values.size:
+        raise ValueError(f"[{model.scenario}] {model.asset}: body and exceedances do not partition the sample")
+
+    draws = rng.choice(body, size=(n_paths, n_days), replace=True)
+    is_tail = rng.random((n_paths, n_days)) < model.zeta_u
+    draws[is_tail] = threshold + genpareto.rvs(
+        model.fit.xi, loc=0.0, scale=model.fit.sigma, size=int(is_tail.sum()), random_state=rng
+    )
+    return draws
+
+
+def expected_shortfall_with_se(values: np.ndarray, p: float) -> tuple[float, float, float]:
+    """Sample VaR_p, ES_p = E[X | X > VaR_p] and the Monte Carlo standard error of ES_p."""
+    value_at_risk = float(np.quantile(values, p))
+    expected_shortfall = float(values[values > value_at_risk].mean())
+    ru_terms = value_at_risk + np.maximum(values - value_at_risk, 0.0) / (1.0 - p)
+    return value_at_risk, expected_shortfall, float(ru_terms.std(ddof=1) / np.sqrt(values.size))
+
+
+horizon_rows: list[dict[str, object]] = []
+for scenario_key in SCENARIOS:
+    for asset in ASSETS:
+        model = tail_models[scenario_key][asset]
+        daily_losses = simulate_daily_losses(
+            model, losses[scenario_key][asset], N_MC_PATHS, max(HORIZONS_DAYS), make_rng(scenario_key, asset, "horizon_mc")
+        )
+        cumulative_losses = daily_losses.cumsum(axis=1)
+        for horizon in HORIZONS_DAYS:
+            horizon_loss = cumulative_losses[:, horizon - 1]
+            horizon_price_shock = -np.expm1(-horizon_loss)  # 1 - exp(-X^(h))
+            for level in HORIZON_LEVELS:
+                value_at_risk, es_log, es_log_se = expected_shortfall_with_se(horizon_loss, level)
+                _, es_shock, es_shock_se = expected_shortfall_with_se(horizon_price_shock, level)
+                horizon_rows.append(
+                    {
+                        "scenario": scenario_key,
+                        "asset": asset,
+                        "confidence_level": level,
+                        "horizon_days": horizon,
+                        "var_log_loss": value_at_risk,
+                        "es_log_loss": es_log,
+                        "es_log_loss_mc_se": es_log_se,
+                        "es_price_shock": es_shock,
+                        "es_price_shock_mc_se": es_shock_se,
+                        "n_paths": N_MC_PATHS,
+                        "return_period_days": return_period_days(level, horizon),
+                        "out_of_sample": is_out_of_sample(level, model.n_obs, horizon),
+                    }
+                )
+        del daily_losses, cumulative_losses
+
+horizon_df = pd.DataFrame(horizon_rows).set_index(["scenario", "asset", "confidence_level", "horizon_days"]).sort_index()
+if min(HORIZONS_DAYS) != 1:
+    raise ValueError("HORIZONS_DAYS must include h = 1, the base of es_ratio_vs_h1 and of the closed-form check")
+horizon_df["es_ratio_vs_h1"] = horizon_df.groupby(level=["scenario", "asset", "confidence_level"])["es_log_loss"].transform(
+    lambda es: es / es.iloc[0]  # rows are sorted by horizon, so iloc[0] is h = 1
+)
+print(f"Monte Carlo: {N_MC_PATHS:,} paths x {max(HORIZONS_DAYS)} days per (scenario, asset); {len(horizon_df)} result rows")
+
+
+# %%
+# Check: h = 1 must reproduce the closed forms of Sections 11 and 16 within Monte Carlo error.
+consistency_rows: list[dict[str, object]] = []
+for scenario_key in SCENARIOS:
+    for asset in ASSETS:
+        for level in HORIZON_LEVELS:
+            simulated = horizon_df.loc[(scenario_key, asset, level, 1)]
+            closed_form = multilevel_df.loc[(scenario_key, asset, level)]
+            consistency_rows.append(
+                {
+                    "scenario": scenario_key,
+                    "asset": asset,
+                    "confidence_level": level,
+                    "var_closed_form": closed_form["var"],
+                    "var_mc": simulated["var_log_loss"],
+                    "es_closed_form": closed_form["es"],
+                    "es_mc": simulated["es_log_loss"],
+                    "es_z": (simulated["es_log_loss"] - closed_form["es"]) / simulated["es_log_loss_mc_se"],
+                    "shock_closed_form": closed_form["es_price_drop"],
+                    "shock_mc": simulated["es_price_shock"],
+                    "shock_z": (simulated["es_price_shock"] - closed_form["es_price_drop"]) / simulated["es_price_shock_mc_se"],
+                }
+            )
+
+consistency_df = pd.DataFrame(consistency_rows).set_index(["scenario", "asset", "confidence_level"])
+max_abs_z = float(consistency_df[["es_z", "shock_z"]].abs().to_numpy().max())
+display(
+    consistency_df.style.format(precision=4)
+    .format({"shock_closed_form": "{:.3%}", "shock_mc": "{:.3%}", "es_z": "{:+.2f}", "shock_z": "{:+.2f}"})
+    .set_caption("Check: h = 1 Monte Carlo versus closed form (z = difference / Monte Carlo standard error)")
+)
+if max_abs_z > MC_CHECK_MAX_Z:
+    raise ValueError(f"h = 1 Monte Carlo does not reproduce the closed form: max |z| = {max_abs_z:.2f} > {MC_CHECK_MAX_Z}")
+print(f"h = 1 Monte Carlo reproduces the closed form for all {len(consistency_df)} cases: max |z| = {max_abs_z:.2f} <= {MC_CHECK_MAX_Z}")
+
+
+# %%
+RESULT_ROW_ORDER = pd.MultiIndex.from_product([SCENARIOS, ASSETS], names=["scenario", "asset"])
+for level in HORIZON_LEVELS:
+    at_level = horizon_df.xs(level, level="confidence_level")
+    display(
+        at_level["es_price_shock"].unstack("horizon_days").reindex(RESULT_ROW_ORDER)
+        .style.format("{:.2%}")
+        .set_caption(f"ES price shock of the h-day loss, p = {level} (columns: horizon h in days)")
+    )
+    display(
+        at_level["es_log_loss"].unstack("horizon_days").reindex(RESULT_ROW_ORDER)
+        .style.format(precision=4)
+        .set_caption(f"ES of the h-day log-loss, p = {level} (columns: horizon h in days)")
+    )
+    display(
+        at_level["es_ratio_vs_h1"].unstack("horizon_days").reindex(RESULT_ROW_ORDER)
+        .style.format(precision=2)
+        .set_caption(f"ES(h) / ES(1), p = {level} (square-root-of-time reference: " + ", ".join(f"h={h}: {np.sqrt(h):.2f}" for h in HORIZONS_DAYS) + ")")
+    )
+
+
+# %% [markdown]
+# ## 18. Break-even price shocks from the Aave parameters
+#
+# Consider a position liquidated at the instant its Health Factor reaches 1, i.e. $HF = C \cdot LT / D = 1$ and $C / D = 1 / LT$, where $C$ is the collateral value and $D$ the debt (stablecoins, so $D$ is constant in debt units). After a collateral price shock $s$ the protocol bears a loss only if the seized collateral cannot cover the repaid debt plus the liquidation bonus:
+#
+# $$
+# C\,(1 - s) < D\,(1 + LB) \iff \frac{1 - s}{LT} < 1 + LB \iff s > 1 - LT\,(1 + LB)
+# $$
+#
+# The two break-even shocks reported are therefore:
+#
+# - **with bonus**: $s^*_{LB} = 1 - LT\,(1 + LB)$, the smallest shock for which the LGD of `docs/decisions.md`, $\max\{0,\, 1 - \tfrac{HF_{entry}}{LT}\tfrac{1 - s}{1 + LB}\}$, is positive at $HF_{entry} = 1$;
+# - **without bonus** ($LB = 0$): $s^*_{0} = 1 - LT$, the shock at which the collateral is worth less than the debt (the position is under water even if the liquidator received no bonus).
+#
+# Because $LB > 0$, $s^*_{LB} < s^*_0$: the bonus makes the loss start earlier.
+#
+# **Parameters.** $LT$ and $LB$ come from `src.utils.protocol_params.load_reserve_params(scenario, date)` at the valuation date $t$ of each scenario (baseline 2024-03-15, stress 2024-08-05), for `WETH`, `wstETH` (ETH shock, since a liquid-staking token is treated as ETH by decision), `WBTC`, `UNI` and `LINK`; the Binance window of each scenario must end on $t$. The base reserve parameters apply, not those of the ETH-correlated eMode category (LT 0.95, LB 0.01): in Aave v3, eMode restricts the borrowable assets to the same category, and the profiles borrow only stablecoins. The break-evens refer to a single-asset position; wallets with several collateral assets are weighted in the ECL notebook.
+
+# %%
+VALUATION_DATES: dict[str, str] = {"baseline": "2024-03-15", "stress": "2024-08-05"}
+AAVE_SYMBOL_TO_ASSET: dict[str, str] = {"WETH": "ETH", "wstETH": "ETH", "WBTC": "BTC", "UNI": "UNI", "LINK": "LINK"}
+BREAKEVEN_KEY_COLUMNS: list[str] = ["scenario", "asset", "aave_symbol"]
+
+
+def breakeven_shocks(liquidation_threshold: float, liquidation_bonus: float) -> tuple[float, float]:
+    """Minimum collateral price shock that causes a loss for a position liquidated at HF = 1.
+
+    Args:
+        liquidation_threshold: LT as a fraction, in (0, 1).
+        liquidation_bonus: LB as a fraction above par, in [0, 1).
+
+    Returns:
+        ``(without_bonus, with_bonus)`` = ``(1 - LT, 1 - LT * (1 + LB))``.
+
+    Raises:
+        ValueError: If LT or LB are outside their valid range.
+    """
+    if not 0.0 < liquidation_threshold < 1.0:
+        raise ValueError(f"liquidation_threshold must lie in (0, 1), got {liquidation_threshold}")
+    if not 0.0 <= liquidation_bonus < 1.0:
+        raise ValueError(f"liquidation_bonus must lie in [0, 1), got {liquidation_bonus}")
+    return 1.0 - liquidation_threshold, 1.0 - liquidation_threshold * (1.0 + liquidation_bonus)
+
+
+def build_breakeven_table() -> pd.DataFrame:
+    """Read LT and LB at the valuation date of each scenario and compute the break-even shocks.
+
+    Raises:
+        ValueError: If the Binance window does not end on the valuation date or the parameters are not for that date.
+        KeyError: If a reserve symbol is missing from the parameter table.
+    """
+    rows: list[dict[str, object]] = []
+    for scenario_key in SCENARIOS:
+        valuation_date = VALUATION_DATES[scenario_key]
+        window_ends = {close_prices[scenario_key][asset].index.max().strftime("%Y-%m-%d") for asset in ASSETS}
+        if window_ends != {valuation_date}:
+            raise ValueError(f"[{scenario_key}] price windows end on {sorted(window_ends)}, expected {valuation_date}")
+
+        params = load_reserve_params(scenario_key, valuation_date)
+        if set(params["date"]) != {valuation_date}:
+            raise ValueError(f"[{scenario_key}] reserve parameters are for {sorted(set(params['date']))}, expected {valuation_date}")
+
+        for symbol, asset in AAVE_SYMBOL_TO_ASSET.items():
+            if not bool(params.loc[params["symbol"] == symbol, "usage_as_collateral_enabled"].iloc[0]):
+                logger.warning("[%s] %s is not enabled as collateral on %s", scenario_key, symbol, valuation_date)
+            liquidation_threshold = get_param(params, symbol, "liquidation_threshold")
+            liquidation_bonus = get_param(params, symbol, "liquidation_bonus")
+            without_bonus, with_bonus = breakeven_shocks(liquidation_threshold, liquidation_bonus)
+            rows.append(
+                {
+                    "scenario": scenario_key,
+                    "asset": asset,
+                    "aave_symbol": symbol,
+                    "lt": liquidation_threshold,
+                    "lb": liquidation_bonus,
+                    "breakeven_no_bonus": without_bonus,
+                    "breakeven_with_bonus": with_bonus,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+breakeven_df = build_breakeven_table().set_index(BREAKEVEN_KEY_COLUMNS)
+display(
+    breakeven_df.style.format(precision=4)
+    .format({"breakeven_no_bonus": "{:.2%}", "breakeven_with_bonus": "{:.2%}"})
+    .set_caption("Break-even price shocks for a position liquidated at HF = 1 (Aave v3 parameters at t)")
+)
+
+
+# %% [markdown]
+# ## 19. ES price shocks versus break-even shocks
+#
+# The ES price shocks of Sections 16-17 are compared with the break-evens of Section 18 for every collateral symbol, using the closed form for $h = 1$ ($p$ = 0.99, 0.995, 0.999) and the Monte Carlo for $h = 2, 3, 5$ ($p$ = 0.99, 0.995). The tables mark the cells where the **ES price shock exceeds the break-even**, i.e. where the tail scenario that the ES describes would leave a loss for the protocol on a position liquidated at $HF = 1$:
+#
+# - **red**: the shock exceeds the break-even **without bonus** (the collateral is worth less than the debt, and the loss also holds for $LB$ = 0); it exceeds the break-even with bonus as well;
+# - **orange**: the shock exceeds only the break-even **with bonus** (the loss is caused by the liquidation bonus);
+# - **no colour**: no loss in the ES scenario.
+#
+# `breakeven_comparison_df` also carries `lgd_hf1`, the LGD of `docs/decisions.md` evaluated at $HF_{entry} = 1$ and the ES price shock. The ES price shock is an average over the tail beyond $VaR_p$, so a cell without colour does not rule out a loss for the worst days of that tail, and a coloured cell does not mean every day beyond $VaR_p$ produces a loss. The Monte Carlo rows inherit the i.i.d. limitation of Section 17, and the $p$ = 0.999 column is an extrapolation (Section 16).
+
+# %%
+SHOCK_GRID_COLUMNS: list[str] = [
+    "scenario", "asset", "confidence_level", "horizon_days", "method",
+    "es_log_loss", "es_price_shock", "ci_low", "ci_high", "out_of_sample_flag",
+]
+METHOD_ORDER: dict[str, int] = {"closed_form": 0, "monte_carlo": 1}
+
+
+def build_shock_grid() -> pd.DataFrame:
+    """Stack the closed-form (h = 1) and Monte Carlo (h >= 1) ES results into one long grid.
+
+    ``ci_low`` / ``ci_high`` are the bootstrap percentile interval of ``es_log_loss`` of Section 16 and are NaN
+    for the Monte Carlo rows.
+    """
+    closed_form = (
+        multilevel_df.reset_index()
+        .assign(horizon_days=1, method="closed_form")
+        .rename(
+            columns={
+                "es": "es_log_loss", "es_price_drop": "es_price_shock",
+                "es_ci_low": "ci_low", "es_ci_high": "ci_high", "out_of_sample": "out_of_sample_flag",
+            }
+        )
+    )
+    monte_carlo = (
+        horizon_df.reset_index()
+        .assign(method="monte_carlo", ci_low=np.nan, ci_high=np.nan)
+        .rename(columns={"out_of_sample": "out_of_sample_flag"})
+    )
+    grid = pd.concat([closed_form[SHOCK_GRID_COLUMNS], monte_carlo[SHOCK_GRID_COLUMNS]], ignore_index=True)
+    order = grid.assign(
+        _scenario=grid["scenario"].map(SCENARIOS.index),
+        _asset=grid["asset"].map(ASSETS.index),
+        _method=grid["method"].map(METHOD_ORDER),
+    ).sort_values(["_scenario", "_asset", "_method", "confidence_level", "horizon_days"], kind="stable")
+    return order[SHOCK_GRID_COLUMNS].reset_index(drop=True)
+
+
+shock_grid_df = build_shock_grid()
+
+is_compared = (shock_grid_df["method"] == "closed_form") | (shock_grid_df["horizon_days"] > 1)
+breakeven_comparison_df = shock_grid_df.loc[is_compared].merge(
+    breakeven_df.reset_index(), on=["scenario", "asset"], how="inner"
+)
+breakeven_comparison_df["exceeds_no_bonus"] = breakeven_comparison_df["es_price_shock"] > breakeven_comparison_df["breakeven_no_bonus"]
+breakeven_comparison_df["exceeds_with_bonus"] = breakeven_comparison_df["es_price_shock"] > breakeven_comparison_df["breakeven_with_bonus"]
+breakeven_comparison_df["lgd_hf1"] = np.maximum(
+    0.0,
+    1.0 - (1.0 - breakeven_comparison_df["es_price_shock"])
+    / (breakeven_comparison_df["lt"] * (1.0 + breakeven_comparison_df["lb"])),
+)
+if (breakeven_comparison_df["exceeds_no_bonus"] & ~breakeven_comparison_df["exceeds_with_bonus"]).any():
+    raise ValueError("A shock above the no-bonus break-even must also exceed the with-bonus break-even")
+
+COLOR_NO_BONUS: str = "background-color: #f4a6a6"
+COLOR_WITH_BONUS: str = "background-color: #fbd9a3"
+
+
+def comparison_wide_table(scenario_key: str) -> pd.DataFrame:
+    """Break-even parameters and ES price shocks of one scenario, one row per Aave symbol."""
+    rows = breakeven_comparison_df[breakeven_comparison_df["scenario"] == scenario_key]
+    shocks = rows.pivot(index="aave_symbol", columns=["confidence_level", "horizon_days"], values="es_price_shock")
+    shocks = shocks.reindex(list(AAVE_SYMBOL_TO_ASSET))
+    shocks.columns = pd.MultiIndex.from_tuples([(f"ES p = {p:.1%}", f"h = {h}") for p, h in shocks.columns])
+    parameters = breakeven_df.xs(scenario_key, level="scenario").droplevel("asset").reindex(list(AAVE_SYMBOL_TO_ASSET))
+    parameters = parameters[["lt", "lb", "breakeven_no_bonus", "breakeven_with_bonus"]]
+    parameters.columns = pd.MultiIndex.from_tuples(
+        [("Break-even", "LT"), ("Break-even", "LB"), ("Break-even", "no bonus"), ("Break-even", "with bonus")]
+    )
+    return pd.concat([parameters, shocks], axis=1)
+
+
+def style_comparison(table: pd.DataFrame, scenario_key: str) -> "pd.io.formats.style.Styler":
+    """Format the comparison table and colour the ES shocks that exceed a break-even."""
+    no_bonus = table[("Break-even", "no bonus")].to_numpy()[:, None]
+    with_bonus = table[("Break-even", "with bonus")].to_numpy()[:, None]
+    shock_columns = [column for column in table.columns if column[0] != "Break-even"]
+    shocks = table[shock_columns].to_numpy()
+
+    css = pd.DataFrame("", index=table.index, columns=table.columns)
+    css[shock_columns] = np.where(shocks > no_bonus, COLOR_NO_BONUS, np.where(shocks > with_bonus, COLOR_WITH_BONUS, ""))
+    formats = {column: "{:.1%}" for column in table.columns if column[0] != "Break-even" or column[1] in ("no bonus", "with bonus")}
+    formats[("Break-even", "LT")] = "{:.2f}"
+    formats[("Break-even", "LB")] = "{:.2f}"
+    return (
+        table.style.format(formats, na_rep="-")
+        .apply(lambda _: css, axis=None)
+        .set_caption(
+            f"ES price shock vs break-even - {scenario_key} scenario "
+            "(red: above break-even without bonus; orange: above break-even with bonus only)"
+        )
+    )
+
+
+for scenario_key in SCENARIOS:
+    display(style_comparison(comparison_wide_table(scenario_key), scenario_key))
+
+
+# %%
+def plot_shock_vs_horizon(scenario_key: str) -> None:
+    """Plot the Monte Carlo ES price shock against the horizon, with the Aave break-even shocks of each asset."""
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9), sharex=True)
+    color = SCENARIO_COLORS[scenario_key]
+    for ax, asset in zip(axes.flat, ASSETS):
+        monte_carlo = shock_grid_df[
+            (shock_grid_df["scenario"] == scenario_key) & (shock_grid_df["asset"] == asset) & (shock_grid_df["method"] == "monte_carlo")
+        ]
+        for level, line_style in zip(HORIZON_LEVELS, ("-", "--")):
+            at_level = monte_carlo[monte_carlo["confidence_level"] == level]
+            ax.plot(at_level["horizon_days"], at_level["es_price_shock"], marker="o", ls=line_style, color=color, lw=1.8, label=f"ES {level} price shock (MC)")
+        for symbol, line_width in zip([s for s, a in AAVE_SYMBOL_TO_ASSET.items() if a == asset], (1.4, 0.9)):
+            row = breakeven_df.loc[(scenario_key, asset, symbol)]
+            ax.axhline(row["breakeven_with_bonus"], color="black", ls=":", lw=line_width, label=f"{symbol} break-even, with bonus")
+            ax.axhline(row["breakeven_no_bonus"], color="dimgrey", ls="-.", lw=line_width, label=f"{symbol} break-even, no bonus")
+        ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
+        ax.set(title=asset, xticks=list(HORIZONS_DAYS), xlabel="Horizon h (days)", ylabel="Price shock")
+        ax.legend(fontsize=7, loc="center right")
+
+    fig.suptitle(f"ES price shock of the h-day loss vs break-even shocks - {scenario_key} scenario (i.i.d. daily losses)", fontsize=14, y=1.01)
+    fig.tight_layout()
+    plt.show()
+
+
+for scenario_key in SCENARIOS:
+    plot_shock_vs_horizon(scenario_key)
+
+
+# %% [markdown]
+# ## 20. Manual export of $ES_{0.99}$ collateral shocks (test dump, not for production)
 #
 # This section is the only part of the notebook that writes to disk. It dumps the parametric $ES_{0.99}$ shock of every collateral asset and market regime to `data/02_interim/notebook_export_evt_shocks_not_for_prod.csv`, in long format with one row per `(scenario, asset)`; scenarios are labelled by their raw-data folder (`baseline_mar2024`, `stress_aug2024`). The file name flags it as a manual test dump of this notebook: it is **not** the official artefact of the automated pipeline and must not be consumed in production.
 #
@@ -1300,4 +1832,192 @@ display(
     .style.format(precision=4)
     .format({"es_price_shock": "{:.2%}", "confidence_level": "{:.2f}", "threshold_quantile": "{:.3f}"})
     .set_caption(f"ES {CONFIDENCE_LEVEL} collateral shocks reloaded from {EVT_SHOCKS_EXPORT_PATH.name}")
+)
+
+
+# %% [markdown]
+# ## 21. Manual export of the ES shock grid and the break-even shocks (test dump, not for production)
+#
+# Two further manual test dumps follow the same pattern and carry the same disclaimer as Section 20: validate, write, reload and compare exactly with the in-memory table; not the official artefact of the automated pipeline; overwritten on every run. The Section 20 file is not modified. Scenarios are labelled by their raw-data folder.
+#
+# **`data/02_interim/evt_shock_grid_not_for_prod.csv`** (long format, one row per `(scenario, asset, confidence_level, horizon_days, method)`; 88 rows = 2 scenarios $\times$ 4 assets $\times$ (3 closed-form levels at $h = 1$ + 4 horizons $\times$ 2 levels by Monte Carlo)):
+#
+# - `method`: `closed_form` (Sections 11 and 16, $h = 1$, $p$ = 0.99, 0.995, 0.999) or `monte_carlo` (Section 17, $h$ = 1, 2, 3, 5, $p$ = 0.99, 0.995; the $h = 1$ rows repeat the closed-form check).
+# - `es_log_loss`, `es_price_shock`: $ES_p$ of the $h$-day log-loss and the matching arithmetic price shock $\mathbb{E}[1 - e^{-X^{(h)}} \mid X^{(h)} > VaR_p^{(h)}]$.
+# - `ci_low`, `ci_high`: bootstrap 95% percentile interval of **`es_log_loss`** (Section 16; it does not refer to `es_price_shock`); NaN for the Monte Carlo rows, where the simulation error is reported in Section 17 but the estimation error of $(\hat\xi, \hat\sigma)$ is not propagated.
+# - `out_of_sample_flag`: `True` when the return period `horizon_days / (1 - confidence_level)` exceeds the number of daily observations of the window (730): $p$ = 0.999 at $h = 1$ and $p$ = 0.995 at $h = 5$. These values extrapolate beyond the data.
+#
+# **`data/02_interim/evt_breakeven_not_for_prod.csv`** (one row per `(scenario, asset, aave_symbol)`; 10 rows): `lt` and `lb` from `load_reserve_params` at $t$, and `breakeven_no_bonus` $= 1 - LT$, `breakeven_with_bonus` $= 1 - LT\,(1 + LB)$ (Section 18).
+#
+# Before writing, the grid is checked for the expected number of rows and unique keys, finite values, $0 <$ `es_price_shock` $< 1$ and `es_price_shock` $\le 1 - e^{-\text{es\_log\_loss}}$ (Jensen), a bootstrap interval present exactly for the closed-form rows and well ordered, strictly increasing ES in $p$, and an `out_of_sample_flag` consistent with its definition. The break-even table is checked for finite values, $LT \in (0,1)$, $LB \in [0,1)$, the two formulas and the ordering $0 <$ with bonus $\le$ no bonus $< 1$.
+
+# %%
+EVT_SHOCK_GRID_EXPORT_PATH: Path = INTERIM_DATA_DIR / "evt_shock_grid_not_for_prod.csv"
+EVT_BREAKEVEN_EXPORT_PATH: Path = INTERIM_DATA_DIR / "evt_breakeven_not_for_prod.csv"
+GRID_KEY_COLUMNS: list[str] = ["scenario", "asset", "confidence_level", "horizon_days", "method"]
+BREAKEVEN_EXPORT_COLUMNS: list[str] = [
+    "scenario", "asset", "aave_symbol", "lt", "lb", "breakeven_no_bonus", "breakeven_with_bonus",
+]
+SCENARIO_FOLDER: dict[str, str] = {key: folder for folder, key in SCENARIO_KEY.items()}
+
+
+def build_shock_grid_export_table(grid: pd.DataFrame) -> pd.DataFrame:
+    """Label the scenarios of the shock grid of Section 19 by their raw-data folder and fix the column dtypes.
+
+    Raises:
+        KeyError: If a required column is missing or a scenario has no folder.
+    """
+    missing_columns = sorted(set(SHOCK_GRID_COLUMNS) - set(grid.columns))
+    if missing_columns:
+        raise KeyError(f"Shock grid is missing columns: {missing_columns}")
+    table = grid[SHOCK_GRID_COLUMNS].copy()
+    unknown_scenarios = sorted(set(table["scenario"]) - set(SCENARIO_FOLDER))
+    if unknown_scenarios:
+        raise KeyError(f"Shock grid has scenarios without a raw-data folder: {unknown_scenarios}")
+    table["scenario"] = table["scenario"].map(SCENARIO_FOLDER)
+    table["horizon_days"] = table["horizon_days"].astype("int64")
+    table["out_of_sample_flag"] = table["out_of_sample_flag"].astype(bool)
+    return table.reset_index(drop=True)
+
+
+def build_breakeven_export_table(breakeven: pd.DataFrame) -> pd.DataFrame:
+    """Label the scenarios of the break-even table of Section 18 by their raw-data folder.
+
+    Raises:
+        KeyError: If a scenario has no raw-data folder.
+    """
+    table = breakeven.reset_index()[BREAKEVEN_EXPORT_COLUMNS].copy()
+    unknown_scenarios = sorted(set(table["scenario"]) - set(SCENARIO_FOLDER))
+    if unknown_scenarios:
+        raise KeyError(f"Break-even table has scenarios without a raw-data folder: {unknown_scenarios}")
+    table["scenario"] = table["scenario"].map(SCENARIO_FOLDER)
+    return table
+
+
+def _failing_rows(table: pd.DataFrame, key_columns: list[str], mask: pd.Series | np.ndarray) -> list[tuple]:
+    """Return the key tuples of the rows selected by a boolean mask."""
+    return list(table.loc[mask, key_columns].itertuples(index=False, name=None))
+
+
+def validate_shock_grid_table(grid: pd.DataFrame, tolerance: float = SHOCK_TOLERANCE) -> None:
+    """Check that every row of the ES shock grid is finite and consistent with the model and its definitions.
+
+    Raises:
+        ValueError: If rows are missing or duplicated, values are non-finite or a consistency rule fails.
+    """
+    expected_rows = len(SCENARIO_DIRS) * len(ASSETS) * (len(ES_LEVELS) + len(HORIZONS_DAYS) * len(HORIZON_LEVELS))
+    if len(grid) != expected_rows:
+        raise ValueError(f"Expected {expected_rows} shock-grid rows, found {len(grid)}")
+    if grid.duplicated(GRID_KEY_COLUMNS).any():
+        raise ValueError(f"Shock grid contains duplicated keys {GRID_KEY_COLUMNS}")
+    unknown_methods = sorted(set(grid["method"]) - set(METHOD_ORDER))
+    if unknown_methods:
+        raise ValueError(f"Unknown methods in the shock grid: {unknown_methods}")
+
+    value_columns = ["confidence_level", "horizon_days", "es_log_loss", "es_price_shock"]
+    is_finite = np.isfinite(grid[value_columns].to_numpy(dtype=float)).all(axis=1)
+    if not is_finite.all():
+        raise ValueError(f"Non-finite shock-grid values for: {_failing_rows(grid, GRID_KEY_COLUMNS, ~is_finite)}")
+
+    is_closed_form = grid["method"] == "closed_form"
+    has_ci = grid["ci_low"].notna() & grid["ci_high"].notna()
+    no_ci = grid["ci_low"].isna() & grid["ci_high"].isna()
+    n_obs = np.array([losses[SCENARIO_KEY[scenario]][asset].size for scenario, asset in zip(grid["scenario"], grid["asset"])])
+    expected_flag = grid["horizon_days"].to_numpy() / (1.0 - grid["confidence_level"].to_numpy()) > n_obs
+
+    rules: dict[str, pd.Series] = {
+        "0 < confidence_level < 1": grid["confidence_level"].between(0.0, 1.0, inclusive="neither"),
+        "horizon_days >= 1": grid["horizon_days"] >= 1,
+        "closed_form only at horizon_days == 1": ~is_closed_form | (grid["horizon_days"] == 1),
+        "es_log_loss > 0": grid["es_log_loss"] > 0.0,
+        "0 < price shock < 1": grid["es_price_shock"].between(0.0, 1.0, inclusive="neither"),
+        "price shock <= 1 - exp(-ES) (Jensen)": grid["es_price_shock"] <= -np.expm1(-grid["es_log_loss"]) + tolerance,
+        "CI present and ordered for closed_form, NaN for monte_carlo": (is_closed_form & has_ci & (grid["ci_low"] <= grid["ci_high"]))
+        | (~is_closed_form & no_ci),
+        "out_of_sample_flag == (horizon_days / (1 - p) > n_obs)": grid["out_of_sample_flag"] == pd.Series(expected_flag, index=grid.index),
+    }
+    for rule, passed in rules.items():
+        if not passed.all():
+            raise ValueError(f"Shock-grid validation failed ({rule}) for: {_failing_rows(grid, GRID_KEY_COLUMNS, ~passed)}")
+
+    by_level = grid.sort_values(["scenario", "asset", "method", "horizon_days", "confidence_level"])
+    group_keys = ["scenario", "asset", "method", "horizon_days"]
+    for column in ("es_log_loss", "es_price_shock"):
+        step = by_level.groupby(group_keys)[column].diff()
+        not_increasing = step.notna() & (step <= 0.0)
+        if not_increasing.any():
+            raise ValueError(f"{column} must increase with confidence_level; failing: {_failing_rows(by_level, GRID_KEY_COLUMNS, not_increasing)}")
+
+    outside_ci = is_closed_form & ~grid["es_log_loss"].between(grid["ci_low"], grid["ci_high"])
+    for scenario_label, asset_label, level in grid.loc[outside_ci, ["scenario", "asset", "confidence_level"]].itertuples(index=False, name=None):
+        logger.warning("[%s] %s p=%s: ES point estimate lies outside its bootstrap CI", scenario_label, asset_label, level)
+
+
+def validate_breakeven_table(table: pd.DataFrame, tolerance: float = 1e-12) -> None:
+    """Check that the break-even table is complete, finite and consistent with the two break-even formulas.
+
+    Raises:
+        ValueError: If rows are missing or duplicated, values are non-finite or a consistency rule fails.
+    """
+    expected_rows = len(SCENARIO_DIRS) * len(AAVE_SYMBOL_TO_ASSET)
+    if len(table) != expected_rows:
+        raise ValueError(f"Expected {expected_rows} break-even rows, found {len(table)}")
+    if table.duplicated(BREAKEVEN_KEY_COLUMNS).any():
+        raise ValueError(f"Break-even table contains duplicated keys {BREAKEVEN_KEY_COLUMNS}")
+
+    value_columns = ["lt", "lb", "breakeven_no_bonus", "breakeven_with_bonus"]
+    is_finite = np.isfinite(table[value_columns].to_numpy(dtype=float)).all(axis=1)
+    if not is_finite.all():
+        raise ValueError(f"Non-finite break-even values for: {_failing_rows(table, BREAKEVEN_KEY_COLUMNS, ~is_finite)}")
+
+    rules: dict[str, pd.Series] = {
+        "asset matches aave_symbol": table["asset"] == table["aave_symbol"].map(AAVE_SYMBOL_TO_ASSET),
+        "0 < lt < 1": table["lt"].between(0.0, 1.0, inclusive="neither"),
+        "0 <= lb < 1": table["lb"].between(0.0, 1.0, inclusive="left"),
+        "breakeven_no_bonus == 1 - lt": pd.Series(
+            np.isclose(table["breakeven_no_bonus"], 1.0 - table["lt"], rtol=0.0, atol=tolerance), index=table.index
+        ),
+        "breakeven_with_bonus == 1 - lt * (1 + lb)": pd.Series(
+            np.isclose(table["breakeven_with_bonus"], 1.0 - table["lt"] * (1.0 + table["lb"]), rtol=0.0, atol=tolerance),
+            index=table.index,
+        ),
+        "0 < with bonus <= no bonus < 1": (table["breakeven_with_bonus"] > 0.0)
+        & (table["breakeven_with_bonus"] <= table["breakeven_no_bonus"])
+        & (table["breakeven_no_bonus"] < 1.0),
+    }
+    for rule, passed in rules.items():
+        if not passed.all():
+            raise ValueError(f"Break-even validation failed ({rule}) for: {_failing_rows(table, BREAKEVEN_KEY_COLUMNS, ~passed)}")
+
+
+evt_shock_grid_export_df = build_shock_grid_export_table(shock_grid_df)
+validate_shock_grid_table(evt_shock_grid_export_df)
+evt_shock_grid_reloaded_df = export_shock_table(evt_shock_grid_export_df, EVT_SHOCK_GRID_EXPORT_PATH)
+logger.info(
+    "ES shock grid written to %s (%d rows; manual notebook dump, NOT for production)",
+    EVT_SHOCK_GRID_EXPORT_PATH.resolve(), len(evt_shock_grid_reloaded_df),
+)
+
+evt_breakeven_export_df = build_breakeven_export_table(breakeven_df)
+validate_breakeven_table(evt_breakeven_export_df)
+evt_breakeven_reloaded_df = export_shock_table(evt_breakeven_export_df, EVT_BREAKEVEN_EXPORT_PATH)
+logger.info(
+    "Break-even shocks written to %s (%d rows; manual notebook dump, NOT for production)",
+    EVT_BREAKEVEN_EXPORT_PATH.resolve(), len(evt_breakeven_reloaded_df),
+)
+
+display(
+    evt_shock_grid_reloaded_df.pivot_table(
+        index=["scenario", "asset"],
+        columns=["method", "confidence_level", "horizon_days"],
+        values="es_price_shock",
+    )
+    .style.format("{:.2%}", na_rep="-")
+    .set_caption(f"ES price shock reloaded from {EVT_SHOCK_GRID_EXPORT_PATH.name} (columns: method, p, h)")
+)
+display(
+    evt_breakeven_reloaded_df.set_index(BREAKEVEN_KEY_COLUMNS)
+    .style.format(precision=4)
+    .format({"breakeven_no_bonus": "{:.2%}", "breakeven_with_bonus": "{:.2%}"})
+    .set_caption(f"Break-even shocks reloaded from {EVT_BREAKEVEN_EXPORT_PATH.name}")
 )
