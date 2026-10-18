@@ -8,10 +8,10 @@ its state *at that block* with ``block: {number: B}``. The queries, the schema
 names and the balance formula were validated in the T1.1 spike
 (``docs/spikes/T1.1_graph_spike.md``).
 
-Windows (inclusive, 61 days each, ``[t - 30, t + 30]``):
+Windows (inclusive, 91 days each, ``[t - 60, t + 30]``):
 
-* baseline: ``2024-02-14 .. 2024-04-14`` (t = 2024-03-15), folder ``baseline_mar2024``.
-* stress: ``2024-07-06 .. 2024-09-04`` (t = 2024-08-05), folder ``stress_aug2024``.
+* baseline: ``2024-01-15 .. 2024-04-14`` (t = 2024-03-15), folder ``baseline_mar2024``.
+* stress: ``2024-06-06 .. 2024-09-04`` (t = 2024-08-05), folder ``stress_aug2024``.
 
 Outputs, under ``<out-root>/<scenario_folder>/``:
 
@@ -36,7 +36,9 @@ Outputs, under ``<out-root>/<scenario_folder>/``:
 * ``protocol/daily_blocks.csv``: date to block cache shared with the other agents.
 * ``thegraph_events/liquidation_calls.csv`` and ``repays.csv``: all events with
   ``timestamp`` in ``[start 00:00 UTC, end + 1 day 00:00 UTC)``, plus
-  ``thegraph_events/metadata.json``.
+  ``thegraph_events/metadata.json`` (union window and total row counts). Extending
+  the window (``--events-only --start ... --end ...``) fetches only the requested
+  days and merges them into the existing files; rows already there are kept as is.
 
 Balance formula (never use the subgraph's ``currentATokenBalance`` /
 ``currentVariableDebt``: they are frozen at the user's last own event, a median
@@ -76,6 +78,7 @@ ever logged.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -335,8 +338,8 @@ class Scenario:
 
 
 SCENARIOS: dict[str, Scenario] = {
-    "baseline": Scenario("baseline", "baseline_mar2024", "2024-02-14", "2024-04-14"),
-    "stress": Scenario("stress", "stress_aug2024", "2024-07-06", "2024-09-04"),
+    "baseline": Scenario("baseline", "baseline_mar2024", "2024-01-15", "2024-04-14"),
+    "stress": Scenario("stress", "stress_aug2024", "2024-06-06", "2024-09-04"),
 }
 
 
@@ -1045,6 +1048,66 @@ def _fetch_events(
     return frame.sort_values(["timestamp", "id"], kind="stable").reset_index(drop=True)
 
 
+def _as_text(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return ``frame`` with every cell as the text ``DataFrame.to_csv`` would write."""
+    return pd.read_csv(io.StringIO(frame.to_csv(index=False)), dtype=str, keep_default_na=False)
+
+
+def _read_event_csv(path: Path) -> pd.DataFrame:
+    """Read an events CSV as text, so rewriting it reproduces the rows already on disk."""
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
+def merge_event_frames(
+    existing: pd.DataFrame | None, new: pd.DataFrame, columns: list[str]
+) -> pd.DataFrame:
+    """Merge a freshly fetched event table into the one already on disk.
+
+    Rows are de-duplicated on ``id`` (the existing row wins) and sorted by
+    ``(timestamp, id)``, the order of ``_fetch_events``. Every cell is returned as
+    text (see ``_as_text``), so the rows of ``existing`` are written back unchanged;
+    ``existing`` must have been read with ``dtype=str`` (see ``_read_event_csv``).
+
+    Raises
+    ------
+    ValueError
+        If ``existing`` does not have exactly ``columns``.
+    """
+    parts = [_as_text(new[columns])]
+    if existing is not None:
+        if list(existing.columns) != columns:
+            raise ValueError(f"Existing events have columns {list(existing.columns)}, expected {columns}.")
+        parts.insert(0, _as_text(existing))
+    merged = pd.concat(parts, ignore_index=True).drop_duplicates("id", keep="first")
+    merged = merged.assign(_timestamp=pd.to_numeric(merged["timestamp"]))
+    merged = merged.sort_values(["_timestamp", "id"], kind="stable").drop(columns="_timestamp")
+    return merged.reset_index(drop=True)
+
+
+def plan_event_fetch(
+    recorded: tuple[int, int] | None, t0: int, t1: int
+) -> tuple[int, int, int, int] | None:
+    """Decide what to fetch for the requested ``[t0, t1)`` given the recorded window.
+
+    Returns ``None`` when the request lies inside ``recorded`` (nothing to do), else
+    ``(fetch_t0, fetch_t1, union_t0, union_t1)``: the interval to fetch and the
+    window the files cover afterwards. The fetch is the request itself, extended up
+    to the recorded window when the two are disjoint with a gap, so that the union
+    never has a hole.
+    """
+    if recorded is None:
+        return t0, t1, t0, t1
+    start, end = recorded
+    if start <= t0 and t1 <= end:
+        return None
+    fetch_t0, fetch_t1 = t0, t1
+    if t1 < start:
+        fetch_t1 = start
+    elif t0 > end:
+        fetch_t0 = end
+    return fetch_t0, fetch_t1, min(t0, start), max(t1, end)
+
+
 def extract_events(
     client: GraphClient,
     scenario: Scenario,
@@ -1054,14 +1117,23 @@ def extract_events(
 ) -> dict[str, int]:
     """Extract liquidation calls and repays with timestamps in ``[start, end + 1 day)``.
 
-    The window is recorded in ``thegraph_events/metadata.json``; if both CSVs
-    exist for exactly the same window, nothing is fetched. Otherwise both files
-    are rebuilt.
+    The window covered by the files is recorded in ``thegraph_events/metadata.json``.
+    If the request lies inside it, nothing is fetched. Otherwise only the requested
+    window is fetched and merged into the existing CSVs (see ``merge_event_frames``:
+    existing rows are never changed), and the metadata records the union window and
+    the total row counts. A rerun after an interruption between the CSV writes and
+    the metadata write is safe: the same window is fetched again and de-duplicated.
 
     Returns
     -------
     dict
-        Row counts: ``liquidation_calls`` and ``repays``.
+        Total row counts in the files: ``liquidation_calls`` and ``repays``.
+
+    Raises
+    ------
+    ValueError
+        If the CSVs exist but are incomplete or the metadata has no window; nothing
+        is overwritten in that case.
     """
     events_dir = out_root / scenario.folder / EVENTS_DIR
     t0 = _utc_midnight_ts(_parse_date(start))
@@ -1070,29 +1142,52 @@ def extract_events(
     metadata_path = events_dir / METADATA_FILE
 
     previous = _read_json(metadata_path)
-    if (
-        liquidations_path.is_file()
-        and repays_path.is_file()
-        and previous.get("start_timestamp") == t0
-        and previous.get("end_timestamp") == t1
-    ):
+    on_disk = [path for path in (liquidations_path, repays_path) if path.is_file()]
+    recorded: tuple[int, int] | None = None
+    if on_disk:
+        recorded_start, recorded_end = previous.get("start_timestamp"), previous.get("end_timestamp")
+        if len(on_disk) < 2 or not isinstance(recorded_start, int) or not isinstance(recorded_end, int):
+            raise ValueError(
+                f"{events_dir}: events files are incomplete or {METADATA_FILE} has no window; "
+                "refusing to overwrite them."
+            )
+        recorded = (recorded_start, recorded_end)
+
+    plan = plan_event_fetch(recorded, t0, t1)
+    if plan is None:
         logger.info("%s: events for [%s, %s] already extracted; skipping.", scenario.folder, start, end)
         return {k: int(previous.get(k, 0)) for k in ("liquidation_calls", "repays")}
+    fetch_t0, fetch_t1, union_t0, union_t1 = plan
+    if (fetch_t0, fetch_t1) != (t0, t1):
+        logger.warning(
+            "%s: [%s, %s] does not touch the recorded events window; fetching %s..%s to leave no gap.",
+            scenario.folder,
+            start,
+            end,
+            _utc_date_of(fetch_t0),
+            _utc_date_of(fetch_t1 - 1),
+        )
 
     liquidations = _fetch_events(
-        client, LIQUIDATIONS_QUERY, "liquidationCalls", liquidation_row, t0, t1, LIQUIDATION_COLUMNS
+        client, LIQUIDATIONS_QUERY, "liquidationCalls", liquidation_row, fetch_t0, fetch_t1, LIQUIDATION_COLUMNS
     )
-    repays = _fetch_events(client, REPAYS_QUERY, "repays", repay_row, t0, t1, REPAY_COLUMNS)
+    repays = _fetch_events(client, REPAYS_QUERY, "repays", repay_row, fetch_t0, fetch_t1, REPAY_COLUMNS)
+    fetched = {"liquidation_calls": len(liquidations), "repays": len(repays)}
+    liquidations = merge_event_frames(
+        _read_event_csv(liquidations_path) if recorded else None, liquidations, LIQUIDATION_COLUMNS
+    )
+    repays = merge_event_frames(_read_event_csv(repays_path) if recorded else None, repays, REPAY_COLUMNS)
     _write_frame(liquidations, liquidations_path)
     _write_frame(repays, repays_path)
+    window_start, window_end = _utc_date_of(union_t0), _utc_date_of(union_t1 - 1)
     _write_json(
         {
             "subgraph_id": AAVE_V3_ETHEREUM_SUBGRAPH_ID,
             "scenario": scenario.folder,
-            "window_start": start,
-            "window_end_inclusive": end,
-            "start_timestamp": t0,
-            "end_timestamp": t1,
+            "window_start": window_start,
+            "window_end_inclusive": window_end,
+            "start_timestamp": union_t0,
+            "end_timestamp": union_t1,
             "liquidation_calls": len(liquidations),
             "repays": len(repays),
             "extraction_timestamp_utc": _now_utc(),
@@ -1101,12 +1196,16 @@ def extract_events(
         metadata_path,
     )
     logger.info(
-        "%s: %s liquidation calls and %s repays in [%s, %s].",
+        "%s: fetched %s liquidation calls and %s repays in [%s, %s]; files now hold %s and %s in [%s, %s].",
         scenario.folder,
+        fetched["liquidation_calls"],
+        fetched["repays"],
+        _utc_date_of(fetch_t0),
+        _utc_date_of(fetch_t1 - 1),
         len(liquidations),
         len(repays),
-        start,
-        end,
+        window_start,
+        window_end,
     )
     return {"liquidation_calls": len(liquidations), "repays": len(repays)}
 

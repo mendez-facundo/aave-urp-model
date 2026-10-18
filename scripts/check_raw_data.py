@@ -1,9 +1,9 @@
 """Validate the re-extracted raw data of both scenarios and run an early diagnostic.
 
-Checks (per scenario, window ``[t - 30, t + 30]`` = 61 days):
+Checks (per scenario, window ``[t - 60, t + 30]`` = 91 days):
 
 1. Dates and blocks: positions, oracle prices, daily blocks, reserve parameters
-   and eMode categories cover the same 61 consecutive dates and share the same
+   and eMode categories cover the same 91 consecutive dates and share the same
    block on each date; ``t`` maps to the block documented in ``CLAUDE.md``.
 2. Coverage: every ``(date, underlying_asset)`` in positions has an oracle
    price and reserve parameters on that day.
@@ -17,7 +17,8 @@ Checks (per scenario, window ``[t - 30, t + 30]`` = 61 days):
 6. Binance daily prices cover the 730 days that end at ``t`` (EVT input).
 
 Section "diagnostic" (APPROXIMATE, not the thesis methodology): on days
-``t - 30`` and ``t``, positions are valued at the Aave oracle price and a Health
+``t - 30`` and ``t`` (the ends of the calibration window ``[t - 30, t]``, not of
+the extraction window), positions are valued at the Aave oracle price and a Health
 Factor is computed per user (see ``raw_data_common``). Profile A (>= 85% of the
 collateral in ETH and ETH LSTs) and profile B (>= 85% in UNI + LINK), both with
 stablecoin-only debt, are counted and their HF is binned by state.
@@ -50,6 +51,7 @@ import pandas as pd  # noqa: E402
 from raw_data_common import (  # noqa: E402
     BINANCE_FILE,
     BLOCKS_FILE,
+    CALIBRATION_DAYS,
     DAILY_DIR,
     EVENTS_DIR,
     HF_STATE_LABELS,
@@ -61,7 +63,6 @@ from raw_data_common import (  # noqa: E402
     RAW_DIR,
     REPAYS_FILE,
     SCENARIOS,
-    WINDOW_HALF_DAYS,
     Scenario,
     day_prices,
     hf_state,
@@ -201,7 +202,7 @@ def check_protocol_and_prices(
 
     # --- oracle
     msg = _dates_match(sorted(oracle["date"].unique()), expected)
-    checks.add("dates_oracle", not msg, msg or "61 consecutive dates")
+    checks.add("dates_oracle", not msg, msg or f"{len(expected)} consecutive dates")
     bad = _block_alignment(oracle, block_of)
     checks.add("blocks_oracle", not bad, "aligned with daily_blocks" if not bad else f"misaligned on {_examples(bad)}")
     duplicated = int(oracle.duplicated(["date", "underlying_asset"]).sum())
@@ -213,11 +214,11 @@ def check_protocol_and_prices(
 
     # --- reserve params and eMode categories
     msg = _dates_match(sorted(reserves["date"].unique()), expected)
-    checks.add("dates_params", not msg, msg or "61 consecutive dates")
+    checks.add("dates_params", not msg, msg or f"{len(expected)} consecutive dates")
     bad = _block_alignment(reserves, block_of)
     checks.add("blocks_params", not bad, "aligned with daily_blocks" if not bad else f"misaligned on {_examples(bad)}")
     msg = _dates_match(sorted(emodes["date"].unique()), expected)
-    checks.add("dates_emode", not msg, msg or "61 consecutive dates")
+    checks.add("dates_emode", not msg, msg or f"{len(expected)} consecutive dates")
     bad = _block_alignment(emodes, block_of)
     checks.add("blocks_emode", not bad, "aligned with daily_blocks" if not bad else f"misaligned on {_examples(bad)}")
     oracle_sets = oracle.groupby("date")["underlying_asset"].agg(frozenset)
@@ -268,11 +269,11 @@ def check_positions(
     daily_dir = folder / DAILY_DIR
     found_days = sorted(m.group(1) for p in daily_dir.glob("positions_*.csv.gz") if (m := _FILE_DATE.fullmatch(p.name)))
     msg = _dates_match(found_days, expected)
-    checks.add("dates_positions", not msg, msg or "61 consecutive daily files")
+    checks.add("dates_positions", not msg, msg or f"{len(expected)} consecutive daily files")
 
     oracle_assets = {day: set(group) for day, group in oracle.groupby("date")["underlying_asset"]}
     params_assets = {day: set(group) for day, group in reserves.groupby("date")["underlying_asset"]}
-    diag_days = {shift_day(sc.t, -WINDOW_HALF_DAYS): "t-30", sc.t: "t"}
+    diag_days = {shift_day(sc.t, -CALIBRATION_DAYS): f"t-{CALIBRATION_DAYS}", sc.t: "t"}
 
     users_by_day: dict[str, set[str]] = {}
     rows_by_day: dict[str, int] = {}
@@ -373,7 +374,8 @@ def check_events(
     """Check 4: events inside the window and presence of their users in the positions."""
     start_ts = utc_midnight_ts(sc.start)
     end_ts = utc_midnight_ts(sc.end) + 86_400
-    ordered_blocks = np.array([blocks[day] for day in expected if day in blocks])
+    present = [day for day in expected if day in blocks]  # same index space as ordered_blocks if blocks are missing
+    ordered_blocks = np.array([blocks[day] for day in present])
     summary: dict[str, Any] = {}
 
     for label, filename in (("liquidation_calls", LIQUIDATIONS_FILE), ("repays", REPAYS_FILE)):
@@ -391,7 +393,7 @@ def check_events(
         in_window_days = events["date"].isin(expected)
         block = pd.to_numeric(events["id"].str.split(":").str[0], errors="coerce")
         day_index = np.searchsorted(ordered_blocks, block.fillna(-1).to_numpy(), side="right") - 1
-        expected_index = events["date"].map({day: i for i, day in enumerate(expected)}).fillna(-2).to_numpy()
+        expected_index = events["date"].map({day: i for i, day in enumerate(present)}).fillna(-2).to_numpy()
         block_ok = block.notna().to_numpy() & (day_index == expected_index)
         duplicated = int(events["id"].duplicated().sum())
 

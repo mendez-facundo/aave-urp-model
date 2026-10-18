@@ -37,7 +37,9 @@ RAW_DIR = PROJECT_ROOT / "data" / "01_raw"
 SAMPLE_DIR = PROJECT_ROOT / "data" / "sample"
 
 DATE_FORMAT = "%Y-%m-%d"
-WINDOW_HALF_DAYS = 30
+WINDOW_BEFORE_DAYS = 60  # window = [t - 60, t + 30], 91 dates
+WINDOW_AFTER_DAYS = 30
+CALIBRATION_DAYS = 30  # Markov calibration window = [t - 30, t]; the diagnostics use its first day
 
 DAILY_DIR = "thegraph_daily"
 EVENTS_DIR = "thegraph_events"
@@ -53,7 +55,7 @@ BLOCKS_FILE = "daily_blocks.csv"
 
 @dataclass(frozen=True)
 class Scenario:
-    """One scenario: valuation date ``t`` and its window ``[t - 30, t + 30]``."""
+    """One scenario: valuation date ``t`` and its window ``[t - 60, t + 30]``."""
 
     key: str
     folder: str
@@ -64,8 +66,8 @@ class Scenario:
 
 
 SCENARIOS: dict[str, Scenario] = {
-    "baseline": Scenario("baseline", "baseline_mar2024", "2024-03-15", "2024-02-14", "2024-04-14", 19_436_645),
-    "stress": Scenario("stress", "stress_aug2024", "2024-08-05", "2024-07-06", "2024-09-04", 20_458_638),
+    "baseline": Scenario("baseline", "baseline_mar2024", "2024-03-15", "2024-01-15", "2024-04-14", 19_436_645),
+    "stress": Scenario("stress", "stress_aug2024", "2024-08-05", "2024-06-06", "2024-09-04", 20_458_638),
 }
 
 # Reserve symbols per group. Only symbols listed on the market on a given day
@@ -107,11 +109,15 @@ POSITION_DTYPES: dict[str, object] = {
 
 
 def window_dates(scenario: Scenario) -> list[str]:
-    """Return the 61 consecutive ``YYYY-MM-DD`` dates of the scenario window."""
-    first = datetime.strptime(scenario.start, DATE_FORMAT).date()
-    last = datetime.strptime(scenario.end, DATE_FORMAT).date()
-    days = (last - first).days + 1
-    return [(first + timedelta(days=offset)).strftime(DATE_FORMAT) for offset in range(days)]
+    """Return the 91 consecutive ``YYYY-MM-DD`` dates of ``[t - 60, t + 30]``.
+
+    Raises:
+        ValueError: If ``scenario.start`` / ``scenario.end`` are not ``t - 60`` / ``t + 30``.
+    """
+    dates = [shift_day(scenario.t, offset) for offset in range(-WINDOW_BEFORE_DAYS, WINDOW_AFTER_DAYS + 1)]
+    if (dates[0], dates[-1]) != (scenario.start, scenario.end):
+        raise ValueError(f"{scenario.key}: window {scenario.start}..{scenario.end} is not [t - 60, t + 30] for t={scenario.t}.")
+    return dates
 
 
 def utc_midnight_ts(day: str) -> int:

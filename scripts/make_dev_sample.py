@@ -1,7 +1,7 @@
 """Build the development sample ``data/sample/`` from the raw extracts.
 
 The sample mirrors the raw layout of each scenario (``baseline_mar2024`` and
-``stress_aug2024``) but keeps ALL 61 days and only ~300 users::
+``stress_aug2024``) but keeps ALL 91 days and only ~300 users::
 
     data/sample/<folder>/thegraph_daily/positions_<date>.csv.gz (+ metadata.json)
     data/sample/<folder>/thegraph_events/{liquidation_calls,repays}.csv (+ metadata.json)
@@ -345,7 +345,7 @@ def write_readme(out_root: Path, summaries: list[dict[str, Any]], seed: int, n_u
         "# Development sample",
         "",
         "Small, reproducible subset of `data/01_raw/` for developing and testing the pipeline. "
-        "All 61 days of each scenario window are kept; only the users are subsampled. "
+        "All 91 days of each scenario window are kept; only the users are subsampled. "
         "Git-ignored (only `.gitkeep` is tracked). Full runs use the raw data.",
         "",
         "## How it was built",

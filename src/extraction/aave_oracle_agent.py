@@ -28,6 +28,10 @@ Outputs, under ``<out-root>/<scenario_folder>/``:
 The run is idempotent and resumable: dates already present in the output CSV
 are not fetched again.
 
+Default windows are ``[t - 60, t + 30]`` (91 days): baseline ``2024-01-15 .. 2024-04-14``
+(t = 2024-03-15) and stress ``2024-06-06 .. 2024-09-04`` (t = 2024-08-05). Extending a
+window only fetches the dates that are missing; existing rows are kept.
+
 Usage, from the repository root::
 
     python src/extraction/aave_oracle_agent.py [--scenario baseline|stress|all]
@@ -104,8 +108,8 @@ class Scenario:
 
 
 SCENARIOS: dict[str, Scenario] = {
-    "baseline": Scenario("baseline_mar2024", "2024-02-14", "2024-04-14", "2024-03-15"),
-    "stress": Scenario("stress_aug2024", "2024-07-06", "2024-09-04", "2024-08-05"),
+    "baseline": Scenario("baseline_mar2024", "2024-01-15", "2024-04-14", "2024-03-15"),
+    "stress": Scenario("stress_aug2024", "2024-06-06", "2024-09-04", "2024-08-05"),
 }
 
 
