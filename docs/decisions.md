@@ -33,6 +33,9 @@ S1 = un evento `repay` tras el cual la deuda total del usuario es ≤ USD 1 en e
 **2026-10-11 · El panel de Markov se construye con snapshots diarios con time-travel de The Graph** (`block: {number: B}`), uno por día de `[t−30, t+30]`.
 El extractor anterior devolvía posiciones de 2026 (ver `docs/findings_graph_extraction.md`). El tramo `(t, t+30]` es para la validación out-of-time.
 
+**2026-10-17 · La ventana diaria se extiende a [t−60, t+30] (91 snapshots) en los mismos archivos raw.**
+Los 30 días previos a t−30 sirven solo para elegir la longitud de la ventana de calibración con validación fuera de muestra (cada fecha s ∈ [t−30, t−1] necesita hasta 30 días previos). El modelo se ajusta solo con las transiciones de la ventana elegida. Los datos raw son append-only: la extensión agrega días y filas después de un backup (`_backup_2026-10-17/`) y no altera las filas existentes; los eventos se combinan por id en lugar de sobrescribirse. *Origen: decisión del usuario (17/10).*
+
 **2026-10-12 · Los wrappers de stablecoins con rendimiento (sDAI, sUSDe) cuentan como colateral estable.**
 Entran en la regla del resto de los perfiles (A: estables o WBTC; B: estables, WETH, LST o WBTC) y en `stable_usd`, valuados al precio del oráculo. No son stablecoins de deuda: la regla de deuda 100% en stablecoins USD no los incluye. *Origen: revisión del coordinador (12/10).*
 
@@ -53,6 +56,9 @@ Se guardan en `data/01_raw/<esc>/protocol/` y se leen con `src/utils/protocol_pa
 `LGD_w = max(0, 1 − (HF_entry / LT_w) · Σ_k s_k (1 − shock_k) / (1 + LB_w))`.
 Justificación: una liquidación mejora C/D si C/D > 1 + LB y lo empeora si C/D < 1 + LB. El umbral no depende de si la liquidación es parcial o total, así que no hace falta modelar las liquidaciones parciales.
 
+**Shock de precio = E[1 − e^(−X) | X > VaR], no 1 − e^(−ES)** (decidido al construir el notebook 03; registrado el 2026-10-17).
+El ES se estima en log-pérdidas X = −r, pero el colateral se estresa en precio. Como 1 − e^(−x) es cóncava, por la desigualdad de Jensen E[1 − e^(−X) | cola] ≤ 1 − e^(−ES): transformar el ES sobreestima levemente la caída esperada del precio. Se usa la caída de precio promediada sobre la cola (`es_price_shock`), que es la caída esperada exacta condicionada a la cola. Para ETH al 99% a 1 día: 13,88% contra 13,99% en baseline y 12,05% contra 12,12% en stress. La diferencia es chica, pero la LGD está cerca del break-even de WETH (12,85%). La forma P·(1 − ES) daría 15,1% y queda descartada. *Origen: decisión del usuario; responde al punto 3 del correo del tutor del 5/10.*
+
 **2026-10-11 · PD a 30 días × LGD de 1 día es coherente.** La PD ya incluye la trayectoria de precios hasta el disparo; la LGD mide lo que pasa entre el disparo y la liquidación. Un shock a 30 días en la LGD contaría dos veces la trayectoria.
 
 **2026-10-11 · Shocks por activo, ponderados por la composición de cada wallet, con dependencia comonótona** (todos los activos caen a la vez con su propio ES). Es un supuesto conservador, explícito, y reemplaza a las cópulas.
@@ -60,6 +66,15 @@ Justificación: una liquidación mejora C/D si C/D > 1 + LB y lo empeora si C/D 
 **2026-10-11 · Shock de los LST = shock de ETH.** El precio de un LST en el oráculo es ETH/USD × la tasa de canje del wrapper, que crece de forma suave. Opcional: verificarlo con la serie del oráculo.
 
 **2026-10-11 · Paridad de las stablecoins se mantiene.** La pérdida se mide en unidades de la stablecoin de la deuda, que es la moneda del Deficit Buffer, así que la paridad de la deuda no influye. Se hace una sensibilidad sobre la parte estable del colateral (referencia: USDC ≈ 0,88 en marzo de 2023).
+
+**2026-10-17 · Precisión sobre la paridad y sensibilidad del lado de la deuda.**
+- **Valuación en el HF:** en el HF (notebook 02), las estables y los LST se valúan a su precio del oráculo de Aave. Las estables quedaron en 0,9988–1,0024 en baseline y 0,9992–1,0009 en stress. Los LST siguen la tasa de canje del wrapper (wstETH/WETH 1,157–1,178).
+- **Supuesto de paridad:** se mantiene solo en la LGD.
+- **Canal de la deuda:** la paridad de la deuda influye por su movimiento relativo u entre el disparo y la liquidación (la retención en unidades de deuda pasa a ser Σ s_k(1 − shock_k)/(1 + u)).
+  - Un movimiento al alza actúa como un shock extra; uno a la baja (el caso histórico, 0,88) reduce la pérdida.
+  - Variantes `S_depeg_debt_*` del 04 (u = +0,5 / +1 / +2 / −12%) y u* de break-even por activo al ES99 de 1 día. WETH da −1,19% en baseline y +0,92% en stress; LINK, +15,9% y +18,4%.
+- **Sensibilidad del colateral:** es inmaterial, porque las estables son el 0,03–0,16% del colateral de las carteras.
+- *Origen: pedido del tutor (5/10, punto 4).*
 
 **2026-10-11 · Datos intradiarios descartados para EVT.** Dan el ES de un horizonte horario, no un mejor ES diario.
 
