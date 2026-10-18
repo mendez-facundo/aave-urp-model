@@ -28,6 +28,25 @@ El spell nuevo es una trayectoria nueva y cuenta como ingreso tardío desde su d
 **2026-10-12 · Umbral de polvo para S1: `DUST_DEBT_USD` = USD 1.**
 S1 = un evento `repay` tras el cual la deuda total del usuario es ≤ USD 1 en el snapshot siguiente, o el usuario desaparece de ese snapshot habiendo tenido un `repay` ese día. Una deuda residual entre USD 1 y el mínimo del panel no es S1: la wallet sale del filtro (censura por salida del filtro). *Origen: confirmación del usuario (12/10).*
 
+**2026-10-17 · La longitud de la ventana de calibración se elige por validación fuera de muestra: W = 30.**
+Reemplaza a la prueba formal de homogeneidad (G² de Anderson-Goodman), que se rechaza siempre con muestras grandes y dependencia dentro de cada wallet, y no guía ninguna decisión. La comparación por subventanas que pidió el tutor se mantiene como diagnóstico, expresada en PD30 por estado (mitades con IC bootstrap y ventanas móviles de 10 días).
+- **Criterio:**
+  - Para cada fecha s ∈ [t−30, t−1] y cada W ∈ {5, 7, 10, 14, 21, 30}, la cadena se reconstruye con las mismas reglas sobre el panel truncado a [s−W, s+1].
+  - P̂_W se estima con las transiciones de origen en [s−W, s−1], con un pseudoconteo de Jeffreys de 0,5 por celda de cada fila transitoria.
+  - Se evalúa la log-verosimilitud de las transiciones de s → s+1 (log score; el Brier, como métrica secundaria). Solo usa información hasta t.
+  - La comparación es pareada, sobre las transiciones de evaluación comunes a todas las W.
+  - Error estándar por bootstrap de wallets (B = 500).
+  - **Regla de 1 EE:** la W más larga cuyo score queda dentro de un EE pareado del mejor. Favorece la estabilidad y no castiga al Perfil B.
+  - **Una sola W para ambos perfiles y ambos escenarios** (score total).
+- **Resultado (corrida completa, 207.320 transiciones de evaluación):**
+  - El mejor log score y el mejor Brier los da W = 21.
+  - W = 30 queda a 0,00006 del mejor, con un EE pareado de 0,00012, así que **W* = 30**, que coincide con la ventana de producción.
+  - W = 5 y W = 7 predicen claramente peor (unos 17 EE).
+  - Por segmento, estrés A, estrés B y baseline B prefieren 30; baseline A, 21.
+- **Consecuencia:** `CALIBRATION_DAYS` sigue en 30. La ventana, elegida al principio de forma arbitraria, queda respaldada empíricamente.
+- **Advertencia:** el criterio predice a un día. La homogeneidad de la proyección a 30 días la evalúa el backtest out-of-time.
+- *Origen: propuesta del usuario (17/10), en respuesta al punto 2 del correo del tutor del 5/10; queda a confirmar con el tutor.*
+
 ## Datos
 
 **2026-10-11 · El panel de Markov se construye con snapshots diarios con time-travel de The Graph** (`block: {number: B}`), uno por día de `[t−30, t+30]`.
@@ -89,6 +108,8 @@ El ES se estima en log-pérdidas X = −r, pero el colateral se estresa en preci
 - Las "conclusiones esperadas" pasan a ser **hipótesis contrastables**.
 
 ## Pendientes (para consultar con el tutor)
+- Confirmar la selección de la ventana de calibración fuera de muestra (W = 30) como reemplazo de la prueba formal de homogeneidad.
+- Suavizado del Perfil B (sin transiciones a S7 en baseline): credibilidad tipo Bühlmann o prior bayesiano hacia la matriz conjunta A+B.
 - GARCH-EVT (PiT) para que la severidad diferencie escenarios, y la profundidad matemática esperada del documento.
 - Si la LGD base sale ≈ 0: horizonte de liquidación de h días (medido con `liquidationCalls`) y/o ES 99,5% como sensibilidad.
 - ES de stress < ES de baseline por el solapamiento de las ventanas de 730 días: ¿alcanza con documentarlo?
