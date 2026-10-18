@@ -42,8 +42,8 @@
 #
 # Four files from `data/02_interim/` are read (the older `notebook_export_*` Markov files are not used):
 #
-# - `markov_segment_params_not_for_prod.csv` (notebook 02, Section 18): per scenario $\times$ profile $\times$ origin state, the counts $n_{S1..S7}$, the full row of $\mathbf{P}^{30}$, the 30-day PD with its wallet-bootstrap interval, and the row depth. Only the base rows (`min_debt_usd = 100`) are used for the main tables.
-# - `markov_wallet_cohorts_not_for_prod.csv` (notebook 02, Section 18): one row per wallet and cohort.
+# - `markov_segment_params_not_for_prod.csv` (notebook 02, Section 15): per scenario $\times$ profile $\times$ origin state, the counts $n_{S1..S7}$, the full row of $\mathbf{P}^{30}$, the 30-day PD with its wallet-bootstrap interval, and the row depth. Only the base rows (`min_debt_usd = 100`) are used for the main tables.
+# - `markov_wallet_cohorts_not_for_prod.csv` (notebook 02, Section 15): one row per wallet and cohort.
 # - `evt_shock_grid_not_for_prod.csv`, `evt_breakeven_not_for_prod.csv` and `notebook_export_evt_shocks_not_for_prod.csv` (notebook 03): ES price shocks by asset, level and horizon; break-even shocks with the Aave LT/LB; the ES 99% base shocks.
 #
 # **Validation.** From the counts the daily matrix is rebuilt: each transient row is normalised by its sum, the rows of `S1` and `S7` are the identity (absorbing by definition), and a transient row without observed transitions is also the identity (it cannot be estimated). Then $\mathbf{P}^{30}$ is recomputed and compared with the exported `p30_*` columns (absolute tolerance $10^{-10}$), and the PD (column `S7`) with `pd30_point`. For an empty row the export leaves `p30_*` and `pd30_*` empty; the rebuilt identity row gives PD $= 0$, which is **not an estimate**: the cell is flagged and the point PD is used as 0 with a degenerate interval.

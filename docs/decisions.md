@@ -40,7 +40,7 @@ Los 30 días previos a t−30 sirven solo para elegir la longitud de la ventana 
 Entran en la regla del resto de los perfiles (A: estables o WBTC; B: estables, WETH, LST o WBTC) y en `stable_usd`, valuados al precio del oráculo. No son stablecoins de deuda: la regla de deuda 100% en stablecoins USD no los incluye. *Origen: revisión del coordinador (12/10).*
 
 **2026-10-12 · Deuda mínima de USD 100 para entrar al panel de perfiles.**
-Un usuario-día entra al panel solo si su deuda total es ≥ USD 100: las wallets con HF ≤ 1 persistente eran casi todas polvo que los liquidadores ignoran (ninguna superaba USD 941 de deuda en el diagnóstico de la Fase 1). Como sensibilidad, el 02 (§17.5) reporta N y PD a 30 días por estado con un mínimo de USD 1.000, usando las mismas funciones. *Origen: confirmación del usuario (12/10), a partir del diagnóstico de la Fase 1.*
+Un usuario-día entra al panel solo si su deuda total es ≥ USD 100: las wallets con HF ≤ 1 persistente eran casi todas polvo que los liquidadores ignoran (ninguna superaba USD 941 de deuda en el diagnóstico de la Fase 1). Como sensibilidad, el 02 (§14) reporta N y PD a 30 días por estado con un mínimo de USD 1.000, usando las mismas funciones. *Origen: confirmación del usuario (12/10), a partir del diagnóstico de la Fase 1.*
 
 **2026-10-11 · Los precios para el HF salen del oráculo de Aave** (`AaveOracle.getAssetsPrices`, un `eth_call` por bloque diario).
 Es el precio que usa el protocolo para liquidar, y resuelve la valuación de los LST (Binance no lista wstETH, rETH ni cbETH). Binance se mantiene para EVT.

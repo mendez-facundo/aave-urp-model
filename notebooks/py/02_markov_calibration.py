@@ -16,25 +16,55 @@
 # %% [markdown]
 # # Markov Calibration of Health Factor States on Aave v3 Daily Snapshots
 #
-# This notebook reads the **daily time-travel snapshots** of Aave v3 (The Graph, one positions file per UTC day), values every position in USD with the **Aave oracle** price of the day, applies the actuarial purity filters, and reconstructs the empirical **Health Factor (HF)** panel used to calibrate a discrete-time Markov chain over the states S1-S7.
+# ## 0. Purpose, conventions and outputs
 #
-# Both valuation windows are processed in parallel:
+# **Purpose.** Rebuild the empirical **Health Factor (HF)** panel of Aave v3 from the **daily time-travel snapshots** (The Graph, one positions file per UTC day, every position valued with the **Aave oracle** price of the day), apply the actuarial purity filters, and calibrate for each market regime and collateral profile a discrete-time **Markov chain over the states S1-S7**. The chain gives the probability that a wallet that starts in a given HF state reaches a liquidation event within 30 days: the PD of $\text{ECL} = \text{EAD} \times \text{PD} \times \text{LGD}$.
 #
-# - **Baseline scenario:** t = 15 March 2024 (`data/01_raw/baseline_mar2024/`)
-# - **Stress scenario:** t = 5 August 2024 (`data/01_raw/stress_aug2024/`)
+# **Scenarios and windows.** Both scenarios are processed in parallel: baseline, $t$ = 15 March 2024 (`data/01_raw/baseline_mar2024/`), and stress, $t$ = 5 August 2024 (`data/01_raw/stress_aug2024/`). Every raw input is filtered at load time to $[t-\text{HISTORY\_DAYS},\, t+\text{OOT\_DAYS}]$ = $[t-30, t+30]$ (61 snapshots); the raw folders may hold a longer range, which is ignored. **Calibration uses $[t-30, t]$ only**: the transition counts $\mathbf{N}$ and the matrices $\mathbf{P}$ come from the 30 daily transitions inside that window. The days $(t, t+30]$ are reserved for the out-of-time validation: they never enter $\mathbf{N}$ or $\mathbf{P}$, but the export records what that backtest needs (`oot_outcome`, `oot_event_date`).
 #
-# Each scenario folder holds 61 daily snapshots for $[t-30, t+30]$. **Calibration uses $[t-30, t]$ only**: the transition counts $\mathbf{N}$ and the matrices $\mathbf{P}$ come from the 30 daily transitions inside that window. The days after $t$ are reserved for the out-of-time validation: they never enter $\mathbf{N}$ or $\mathbf{P}$, but the export of Section 18 records what that backtest needs (`oot_outcome`, `oot_event_date`).
+# **States and Health Factor cut-offs.**
 #
-# Positions are valued as `collateral_usd = a_token_balance * oracle price` and `debt_usd = (variable_debt + stable_debt) * oracle price`. Liquidation thresholds (LT), liquidation bonuses (LB) and eMode categories are read **day by day** from `src.utils.protocol_params`; the fixed constants of `src.utils.config` are no longer used. Binance prices are not used in this notebook.
+# | State | Definition |
+# |---|---|
+# | S2 | $HF \ge 2.0$ |
+# | S3 | $1.5 \le HF < 2.0$ |
+# | S4 | $1.25 \le HF < 1.5$ |
+# | S5 | $1.10 \le HF < 1.25$ |
+# | S6 | $1.0 < HF < 1.10$ |
+# | **S7** | **liquidation event (technical default)**: $HF \le 1$ in the daily snapshot, or a `liquidationCall` on the wallet in the interval that ends on that day |
+# | **S1** | **repayment observed on-chain**: a `repay` event after which the total debt is at most `DUST_DEBT_USD` (USD 1) in the next snapshot |
 #
-# **State vocabulary.** `S1` is a *repayment observed on-chain*; `S7` is a *liquidation event* (technical default): Health Factor $\le 1$ in the daily snapshot, or a `liquidationCall` on the wallet. `S1` and `S7` are **absorbing by definition**: the trajectory ends at the first hit. **Censoring** is a different thing and only applies to wallets whose outcome is not observed (`censored_window_end`, `censored_filter_exit`).
+# $HF = \sum_i (\text{collateral USD}_i \times LT_i) / \text{total debt USD}$, with the liquidation thresholds of the day (`src.utils.protocol_params`, the single source of LT, LB and eMode; the fixed constants of `src.utils.config` are not used, and Binance prices are not used here).
+#
+# **Conventions (from `docs/decisions.md`; none is re-litigated here).**
+#
+# 1. **Causal timing of events.** Snapshots are taken at 00:00 UTC, so an event dated $d$ happens between snapshot $d$ and snapshot $d+1$ and is attached to the transition $d \to d+1$ (`LIQUIDATION_DAY_OFFSET = 0`). The wallet is `S7` on $d+1$, where its HF is already restored. The calibration therefore uses information up to the snapshot of $t$ only: the liquidations dated $t$ itself (in stress, the crash of 2024-08-05) fall in the out-of-time period. Repayments are read the same way: `S1` is defined by the debt of the next snapshot.
+# 2. **`S1` and `S7` are absorbing by definition, not censoring.** The trajectory ends at the first hit, nothing is forward-filled, the `S1` and `S7` rows of $\mathbf{P}$ are the identity and their rows of $\mathbf{N}$ are 0. After an `S7` the wallet is not followed again inside the window; a repayment closes a *spell* and a new borrowing opens a new one (a late entrant).
+# 3. **Censoring** applies only to wallets whose outcome is not observed: still transient on $t$ (`censored_window_end`) or out of the profile filter with debt $> 0$ for good (`censored_filter_exit`). The trajectory is cut at the last observation, without `S1`. Transitions across days on which the wallet is not observed are never counted.
+# 4. **Minimum debt.** A user-day enters the panel only with `total_debt_usd >= MIN_DEBT_USD` (USD 100); a USD 1,000 minimum is reported as a sensitivity (Section 14).
+# 5. **Profiles.** A: at least 85% of the collateral in ETH and ETH liquid staking tokens. B: at least 85% in UNI + LINK. Debt 100% in USD stablecoins; the yield-bearing wrappers sDAI and sUSDe count as stable collateral. A wallet's profile is the set of daily labels it shows inside $[t-30, t]$; hybrid wallets (A on some days, B on others) are dropped.
+#
+# **Outputs (Section 15, written to `data/02_interim/`, or to `data/sample/02_interim/` in a sample run).**
+#
+# - `markov_segment_params_not_for_prod.csv`: per scenario, profile and origin state, the counts $n_{S1..S7}$, the full row of $\mathbf{P}^{30}$, the 30-day PD with its wallet-bootstrap interval and the row depth. Consumed by notebook 04 (PD side of the ECL).
+# - `markov_wallet_cohorts_not_for_prod.csv`: one row per wallet and cohort. The `valuation` cohort (wallets observed on $t$: state and EAD) feeds notebook 04; the `day1` cohort feeds its in-sample backtest; `s7_trigger`, `hf_at_s7_entry`, `lt_w` and `lb_w` are for the LGD module, and the `oot_*` columns for the later out-of-time backtest.
+#
+# **Layout.** Part A, inputs (Sections 1-2). Part B, panel (3-6). Part C, states and trajectories (7-9). Part D, estimation of $\mathbf{N}$, $\mathbf{P}$, $\mathbf{P}^{30}$ and the PD (10-11). Part E, robustness (12-14). Part F, export and summary (15-16).
 #
 # **Development.** The raw folder is configurable through `RAW_DATA_DIR` (default `../data/01_raw`; set the environment variable `MARKOV_RAW_DATA_DIR=../data/sample` to develop on the small sample). A run on the sample writes its exports under `data/sample/02_interim/` so that it can never be mistaken for a full run.
 
 # %% [markdown]
-# ## 1. Imports
+# # Part A. Inputs
+#
+# ## 1. Imports and parameters
+#
+# A single cell holds the imports and **every tunable parameter** of the notebook, grouped by the part that uses them, so that a sensitivity run edits one place. The values that are derived from them (day indices, window dates, state indices) are computed in the same cell.
+#
+# - **Window.** `HISTORY_DAYS` days before $t$ and `OOT_DAYS` days after $t$ are loaded; `CALIBRATION_DAYS` is the length of the calibration window $[t-30, t]$. Days are indexed by `day` (`t-30 = 0`, `t = 30`) and wallets by `wid`; both are combined in the key `key = wid * DAY_STRIDE + day`, which turns "the same wallet on the next day" into `key + 1` and keeps the transition logic of Section 8 vectorised. The index of day 0 is the first loaded day, so the notebook requires `HISTORY_DAYS == CALIBRATION_DAYS`.
+# - **Why the date filter.** The raw folders are being extended to $[t-60, t+30]$. Without a filter the earlier days would get negative `day` indices and collide with other wallets in the key. Every loader of Section 2 therefore keeps only the dates in $[t-\text{HISTORY\_DAYS},\, t+\text{OOT\_DAYS}]$ and asserts it.
 
 # %%
+import json
 import os
 import sys
 import warnings
@@ -68,40 +98,15 @@ plt.rcParams.update(
 pd.set_option("display.max_columns", 50)
 pd.set_option("display.max_colwidth", 80)
 
-
-def chi2_sf(statistic: float, dof: int) -> float:
-    """Chi-square survival function (``scipy.special`` only: ``scipy.stats`` is blocked on some Windows setups)."""
-    return float(gammaincc(dof / 2.0, statistic / 2.0))
-
-
-def ks_two_sample(first: pd.Series, second: pd.Series) -> tuple[float, float]:
-    """Two-sample Kolmogorov-Smirnov statistic and its asymptotic p-value."""
-    a, b = np.sort(first.to_numpy(dtype=float)), np.sort(second.to_numpy(dtype=float))
-    grid = np.concatenate([a, b])
-    gap = np.abs(np.searchsorted(a, grid, side="right") / len(a) - np.searchsorted(b, grid, side="right") / len(b))
-    statistic = float(gap.max())
-    effective_n = np.sqrt(len(a) * len(b) / (len(a) + len(b)))
-    return statistic, float(kolmogorov(effective_n * statistic))
-
-
-# %% [markdown]
-# ## 2. Configuration and data loading
-#
-# `RAW_DATA_DIR` points to the raw folder; each scenario sub-folder is read through the layout written by the extraction agents:
-#
-# - `thegraph_daily/positions_<date>.csv.gz`: accrued balances per (user, reserve) at the first block at or after 00:00 UTC (`a_token_balance`, `variable_debt`, `stable_debt` in token units).
-# - `thegraph_events/{liquidation_calls,repays}.csv`: the on-chain events of the window.
-# - `protocol/{reserve_params_daily,emode_categories_daily,daily_blocks}.csv`: LT, LB, LTV, eMode and snapshot blocks.
-# - `prices/aave_oracle_daily.csv`: USD price used by the protocol, one row per (date, reserve).
-#
-# Wallets and days are also indexed by integers (`wid`, `day` with `t-30 = 0` and `t = 30`) and combined in a single key, `key = wid * DAY_STRIDE + day`. This turns "the same wallet on the next day" into `key + 1` and keeps the transition logic of Section 14 vectorised.
-
-# %%
+# --- Paths and development mode (Section 2 and Section 15) ----------------------------------------
 RAW_DATA_DIR = Path(os.environ.get("MARKOV_RAW_DATA_DIR", "../data/01_raw"))
 SAMPLE_DATA_DIR = Path("../data/sample")
 IS_SAMPLE_RUN = RAW_DATA_DIR.resolve() == SAMPLE_DATA_DIR.resolve()
 INTERIM_DATA_DIR = SAMPLE_DATA_DIR / "02_interim" if IS_SAMPLE_RUN else Path("../data/02_interim")
+SEGMENT_EXPORT_PATH = INTERIM_DATA_DIR / "markov_segment_params_not_for_prod.csv"
+COHORT_EXPORT_PATH = INTERIM_DATA_DIR / "markov_wallet_cohorts_not_for_prod.csv"
 
+# --- Scenarios and window (Section 2) -------------------------------------------------------------
 SCENARIO_KEYS = [
     ("baseline", "baseline_mar2024"),
     ("stress", "stress_aug2024"),
@@ -112,16 +117,118 @@ VALUATION_DATE = {
     "stress": pd.Timestamp("2024-08-05"),
 }
 
-CALIBRATION_DAYS = 30
-OOT_DAYS = 30
+HISTORY_DAYS = 30  # days before t kept from the raw folders (the folders may hold more: it is ignored)
+CALIBRATION_DAYS = 30  # calibration window [t - 30, t]
+OOT_DAYS = 30  # out-of-time window (t, t + 30]
+assert HISTORY_DAYS == CALIBRATION_DAYS, "Day 0 is the first loaded day: the calibration window must be the whole history."
 T_IDX = CALIBRATION_DAYS  # day index of the valuation date t
 LAST_IDX = CALIBRATION_DAYS + OOT_DAYS  # day index of t + 30
 N_DAYS = LAST_IDX + 1
 DAY_STRIDE = 64  # key = wid * DAY_STRIDE + day; DAY_STRIDE > N_DAYS so keys never cross wallets
+SPELL_STRIDE = 16  # at most 16 spells per wallet (repay, borrow again, ...); sid = wid * SPELL_STRIDE + spell
+assert DAY_STRIDE > N_DAYS, "Keys would cross wallets."
 
-DAY1_DATE = {key: date - pd.Timedelta(CALIBRATION_DAYS, unit="D") for key, date in VALUATION_DATE.items()}
-OOT_END_DATE = {key: date + pd.Timedelta(OOT_DAYS, unit="D") for key, date in VALUATION_DATE.items()}
+DAY1_DATE = {key: date - pd.Timedelta(HISTORY_DAYS, unit="D") for key, date in VALUATION_DATE.items()}  # day 0
+OOT_END_DATE = {key: date + pd.Timedelta(OOT_DAYS, unit="D") for key, date in VALUATION_DATE.items()}  # day LAST_IDX
 
+PARAM_SYMBOLS = ["WETH", "wstETH", "rETH", "cbETH", "WBTC", "UNI", "LINK", "USDC", "USDT", "DAI"]  # shown in Section 2.4
+
+# --- Valuation and profile classification (Sections 3-4) ------------------------------------------
+ETH_CORE = {"WETH", "wstETH", "rETH", "cbETH", "weETH", "osETH", "ETHx"}  # WETH and ETH liquid staking tokens
+WBTC_SET = {"WBTC"}
+PROFILE_B_CORE = {"UNI", "LINK"}
+STABLE_SYMBOLS = {"USDC", "USDT", "DAI", "FRAX", "LUSD", "GHO", "PYUSD", "crvUSD", "USDe"}  # USD stablecoins (debt rule)
+STABLE_WRAPPERS = {"sDAI", "sUSDe"}  # yield-bearing wrappers of USD stablecoins: stable collateral, valued at the oracle price
+STABLE_COLLATERAL = STABLE_SYMBOLS | STABLE_WRAPPERS
+SYMBOL_GROUP = {
+    **{symbol: "eth_core" for symbol in ETH_CORE},
+    "WBTC": "wbtc",
+    "UNI": "uni",
+    "LINK": "link",
+    **{symbol: "stable" for symbol in STABLE_COLLATERAL},
+}
+GROUPS = ["eth_core", "wbtc", "uni", "link", "stable", "other"]
+DUST_USD = 1e-4  # numerical floor of the valuation (Section 3), unrelated to DUST_DEBT_USD
+AUDIT_SAMPLE_ROWS = 5000
+AUDIT_SEED = 20240315
+DOMINANCE_THRESHOLD = 0.85  # share of the collateral that defines profile A / B
+STABLE_DEBT_TOLERANCE = 1e-8  # relative tolerance of the "debt is 100% stablecoin" rule
+
+# --- Panel (Sections 5-6) ---------------------------------------------------------------------------
+MIN_DEBT_USD = 100.0  # minimum total debt of a user-day to enter the profile panel
+
+# --- States and trajectories (Sections 7-9) ----------------------------------------------------------
+DUST_DEBT_USD = 1.0  # S1: total debt after a repay event is <= this amount (USD)
+# An event dated d belongs to the transition (d - offset) -> (d - offset + 1); see Section 7.
+LIQUIDATION_DAY_OFFSET = 0  # 0: events dated d -> transition d -> d+1 (causal); 1: same-day variant
+REPAY_DAY_OFFSET = 0  # keep at 0: S1 is read from the next snapshot
+LIQUIDATION_HF_THRESHOLD = 1.0
+
+HF_STATE_BINS = [-np.inf, 1.0, 1.10, 1.25, 1.50, 2.0, np.inf]
+HF_STATE_LABELS = ["S7", "S6", "S5", "S4", "S3", "S2"]
+STATE_ORDER = ["S1", "S2", "S3", "S4", "S5", "S6", "S7"]
+TRANSIENT_STATES = ["S2", "S3", "S4", "S5", "S6"]
+ABSORBING_STATES = ["S1", "S7"]
+EXIT_REASONS = ["S1_repay", "S7_hf", "S7_liquidation_call", "censored_filter_exit", "censored_window_end"]
+ABSORBING_PRIORITY = {"S7_hf": 0, "S7_liquidation_call": 1, "S1_repay": 2}
+
+STATE_INDEX = {state: idx for idx, state in enumerate(STATE_ORDER)}
+N_STATES = len(STATE_ORDER)
+ABSORBING_IDX = [STATE_INDEX[state] for state in ABSORBING_STATES]
+S7_STATE_IDX = STATE_INDEX["S7"]
+
+SCENARIO_PRINT_ORDER = [key for key, _ in SCENARIO_KEYS]
+PROFILE_KEYS = ["A", "B"]
+PROFILE_PRINT_ORDER = PROFILE_KEYS
+PROFILE_TITLES = {
+    "A": "Profile A (ETH dominance)",
+    "B": "Profile B (UNI+LINK dominance)",
+}
+
+# --- Estimation (Sections 10-11) ----------------------------------------------------------------------
+MIN_ROW_DEPTH = 30  # origin states with fewer transitions are flagged as thin
+N_BOOTSTRAP = 500
+BOOTSTRAP_SEED = 20240315
+CI_PERCENTILES = (2.5, 97.5)
+HORIZON_DAYS = 30
+
+# --- Robustness (Sections 12-14) ----------------------------------------------------------------------
+HALF_WINDOW_DAYS = 15
+HOMOGENEITY_ALPHA = 0.05
+FIRST_HALF, SECOND_HALF = "days_01_15", "days_16_30"
+SENSITIVITY_SHIFT = 0.05  # shift of the intermediate HF cut points (Section 13)
+INTERMEDIATE_BOUNDARIES = (1.10, 1.25, 1.50)
+MIN_DEBT_SENSITIVITY_USD = 1000.0
+
+# --- Export (Section 15) --------------------------------------------------------------------------------
+STOCHASTIC_TOLERANCE = 1e-9
+ROUND_TRIP_TOLERANCE = 1e-12
+DATE_FORMAT = "%Y-%m-%d"
+
+# %% [markdown]
+# ## 2. Raw inputs: loading and validation
+#
+# `RAW_DATA_DIR` points to the raw folder; each scenario sub-folder is read through the layout written by the extraction agents:
+#
+# - `thegraph_daily/positions_<date>.csv.gz`: accrued balances per (user, reserve) at the first block at or after 00:00 UTC (`a_token_balance`, `variable_debt`, `stable_debt` in token units).
+# - `thegraph_events/{liquidation_calls,repays}.csv`: the on-chain events of the window.
+# - `protocol/{reserve_params_daily,emode_categories_daily,daily_blocks}.csv`: LT, LB, LTV, eMode and snapshot blocks.
+# - `prices/aave_oracle_daily.csv`: USD price used by the protocol, one row per (date, reserve).
+#
+# **Date filter.** Each input is restricted to $[t-\text{HISTORY\_DAYS},\, t+\text{OOT\_DAYS}]$ when it is loaded: the position files by the date in their name (before they are read), the other tables by their `date` column. After loading, `assert_in_window` checks that every loaded date lies in the window. On a raw folder that holds exactly the 61 window days the filter changes nothing.
+
+# %% [markdown]
+# ### 2.1 Daily positions: loading, inspection and validation
+#
+# The extractor writes the long format (one row per user, reserve and day), so no nested history has to be unnested. The next three cells:
+#
+# 1. **Load** the position files of the window, using the file date to skip the days outside it.
+# 2. **Inspect** what the extraction wrote: file groups and sizes, columns, metadata and one day of positions. The last check recomputes the token balances from the scaled balances and the Aave indices (`balance = scaled * index / 1e27 / 10**decimals`) on day $t$, to confirm that the float columns used below are the accrued balances and not the stale `current*` fields of the subgraph (the files store them rounded to 6 decimals).
+# 3. **Validate** the panel: the 61 UTC days $[t-30, t+30]$ are present and consecutive, every day uses the snapshot block of `protocol/daily_blocks.csv`, and there is no duplicated (day, user, reserve) row.
+#
+# A wallet is **observed** on a day when it appears in that day's snapshot. The universe is not fixed: wallets enter when they borrow and leave when they repay or are liquidated.
+
+# %%
 POSITION_DTYPES = {
     "date": str,
     "block": "int64",
@@ -136,17 +243,43 @@ POSITION_DTYPES = {
 }
 
 
-def load_positions(scenario_dir: Path) -> pd.DataFrame:
-    """Read and stack the daily positions files of a scenario (one row per user, reserve and day)."""
+def assert_in_window(dates: pd.Series, scenario_key: str, name: str) -> None:
+    """Every loaded date must lie in [t - HISTORY_DAYS, t + OOT_DAYS]; otherwise day indices and keys are invalid."""
+    first, last = DAY1_DATE[scenario_key], OOT_END_DATE[scenario_key]
+    assert dates.empty or (dates.min() >= first and dates.max() <= last), (
+        f"{scenario_key}: {name} has dates outside the window [{first.date()}, {last.date()}]."
+    )
+
+
+def restrict_to_window(table: pd.DataFrame, scenario_key: str, name: str) -> pd.DataFrame:
+    """Keep the rows dated inside [t - HISTORY_DAYS, t + OOT_DAYS] (the raw folders may cover more days)."""
+    in_window = table["date"].between(DAY1_DATE[scenario_key], OOT_END_DATE[scenario_key])
+    if not in_window.all():
+        print(f"[{scenario_key}] {name}: {int((~in_window).sum()):,} of {len(in_window):,} rows lie outside the window and are ignored")
+    kept = table.loc[in_window].reset_index(drop=True)
+    assert_in_window(kept["date"], scenario_key, name)
+    return kept
+
+
+def position_files(scenario_dir: Path, scenario_key: str) -> list[Path]:
+    """Daily positions files whose file date lies in the window [t - HISTORY_DAYS, t + OOT_DAYS]."""
     files = sorted((scenario_dir / "thegraph_daily").glob("positions_*.csv.gz"))
+    dated = [(pd.Timestamp(path.name.removeprefix("positions_").removesuffix(".csv.gz")), path) for path in files]
+    return [path for date, path in dated if DAY1_DATE[scenario_key] <= date <= OOT_END_DATE[scenario_key]]
+
+
+def load_positions(scenario_dir: Path, scenario_key: str) -> pd.DataFrame:
+    """Read and stack the daily positions files of a scenario inside the window (one row per user, reserve and day)."""
+    files = position_files(scenario_dir, scenario_key)
     if not files:
-        raise FileNotFoundError(f"No positions_*.csv.gz files under {scenario_dir.resolve()}")
+        raise FileNotFoundError(f"No positions_*.csv.gz files in the window under {scenario_dir.resolve()}")
     frames = [
         pd.read_csv(path, usecols=list(POSITION_DTYPES), dtype=POSITION_DTYPES, keep_default_na=False)
         for path in files
     ]
     positions = pd.concat(frames, ignore_index=True)
     positions["date"] = pd.to_datetime(positions["date"])
+    assert_in_window(positions["date"], scenario_key, "positions")
     return positions
 
 
@@ -155,17 +288,16 @@ print(f"INTERIM_DATA_DIR = {INTERIM_DATA_DIR.resolve()}")
 
 positions_by_scenario: dict[str, pd.DataFrame] = {}
 for scenario_key, scenario_label in SCENARIO_KEYS:
-    positions_by_scenario[scenario_key] = load_positions(RAW_DATA_DIR / scenario_label)
+    scenario_dir = RAW_DATA_DIR / scenario_label
+    n_files_on_disk = len(list((scenario_dir / "thegraph_daily").glob("positions_*.csv.gz")))
+    positions_by_scenario[scenario_key] = load_positions(scenario_dir, scenario_key)
     positions = positions_by_scenario[scenario_key]
     print(
         f"[{scenario_key}] {scenario_label}: {len(positions):,} position rows, "
-        f"{positions['date'].nunique()} days, {positions['user_id'].nunique():,} distinct borrowers"
+        f"{positions['date'].nunique()} days, {positions['user_id'].nunique():,} distinct borrowers "
+        f"(window {DAY1_DATE[scenario_key].date()} -> {OOT_END_DATE[scenario_key].date()}; "
+        f"{len(position_files(scenario_dir, scenario_key))} of {n_files_on_disk} position files read)"
     )
-
-# %% [markdown]
-# ## 3. Inspection of the new files
-#
-# A compact look at what the extraction wrote: file groups and sizes, columns, metadata and one day of positions. The last check recomputes the token balances from the scaled balances and the Aave indices (`balance = scaled * index / 1e27 / 10**decimals`) on day $t$, to confirm that the float columns used below are the accrued balances and not the stale `current*` fields of the subgraph (the files store them rounded to 6 decimals).
 
 # %%
 FILE_GROUPS = {
@@ -190,6 +322,7 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
                     "scenario": scenario_label,
                     "file": name,
                     "n_files": len(group),
+                    "n_in_window": len(position_files(scenario_dir, scenario_key)) if sub_folder == "thegraph_daily" else np.nan,
                     "size_mb": round(sum(path.stat().st_size for path in group) / 1e6, 2),
                 }
             )
@@ -201,8 +334,6 @@ display(pd.DataFrame(file_records).set_index(["scenario", "file"]))
 print("Columns (baseline files):")
 for name, columns in columns_by_file.items():
     print(f"  {name}: {columns}")
-
-import json
 
 for scenario_key, scenario_label in SCENARIO_KEYS:
     meta_path = RAW_DATA_DIR / scenario_label / "thegraph_daily" / "metadata.json"
@@ -234,17 +365,6 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
     print(f"[{scenario_key}] recomputed balances: max excess error beyond the 6-decimal rounding: aToken={err_a:.2e}, variable debt={err_v:.2e} tokens")
     assert err_a < 5.1e-7 and err_v < 5.1e-7, "File balances differ from scaled balance x index."
 
-# %% [markdown]
-# ## 4. Daily positions panel
-#
-# The extractor already writes the long format (one row per user, reserve and day), so no nested history has to be unnested: the flattening of the old notebook disappears. This section only validates the panel:
-#
-# - the 61 UTC days $[t-30, t+30]$ are present and consecutive,
-# - every day uses the snapshot block of `protocol/daily_blocks.csv`,
-# - there is no duplicated (day, user, reserve) row.
-#
-# A wallet is **observed** on a day when it appears in that day's snapshot. The universe is not fixed: wallets enter when they borrow and leave when they repay or are liquidated.
-
 # %%
 daily_blocks_by_scenario: dict[str, pd.DataFrame] = {}
 for scenario_key, scenario_label in SCENARIO_KEYS:
@@ -254,6 +374,7 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
     assert observed_days.equals(expected_days), f"{scenario_label}: positions days are not the 61 consecutive window days."
 
     blocks = pd.read_csv(RAW_DATA_DIR / scenario_label / "protocol" / "daily_blocks.csv", parse_dates=["date"])
+    blocks = restrict_to_window(blocks, scenario_key, "daily_blocks")
     daily_blocks_by_scenario[scenario_key] = blocks
     block_by_day = positions.groupby("date")["block"].agg(["min", "max"])
     assert (block_by_day["min"] == block_by_day["max"]).all(), f"{scenario_label}: more than one block on a day."
@@ -267,9 +388,39 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
     )
 
 # %% [markdown]
-# ## 5. Liquidation and repayment events
+# ### 2.2 Daily universe
 #
-# `liquidationCalls` define one of the two triggers of `S7`; `repays` define `S1`. Both are keyed by the **borrower** (`user_id`) and the UTC date of the event. A snapshot is taken at the first block at or after 00:00 UTC of its date, so an event dated $d$ happens **after** snapshot $d$ and **before** snapshot $d+1$. Section 13 uses this timing to attach each event to a transition.
+# Number of borrowers per day (all snapshot users, before any profile filter) and the number of reserves with debt per borrower on $t$. The universe changes from day to day, which is what the old extract could not show: the previous panel was built from a single set of users observed in 2026.
+
+# %%
+universe_by_day: dict[str, pd.Series] = {}
+fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
+for ax, (scenario_key, scenario_label) in zip(axes, SCENARIO_KEYS):
+    positions = positions_by_scenario[scenario_key]
+    universe = positions.groupby("date")["user_id"].nunique().rename("borrowers")
+    universe_by_day[scenario_key] = universe
+    assert universe.nunique() > 1, f"{scenario_label}: the universe does not change between days."
+    print(
+        f"[{scenario_key}] borrowers per day: min={universe.min():,} median={int(universe.median()):,} max={universe.max():,}"
+    )
+    display(universe.iloc[[0, 1, 2, T_IDX - 1, T_IDX, T_IDX + 1, LAST_IDX]].to_frame().T)
+
+    debt_reserves = (
+        positions.loc[(positions["date"] == VALUATION_DATE[scenario_key]) & (positions["variable_debt"] > 0)]
+        .groupby("user_id")
+        .size()
+    )
+    debt_reserves.value_counts().sort_index().plot(kind="bar", ax=ax, color="#4C72B0")
+    ax.set_title(f"{scenario_label}: reserves with debt per borrower on t")
+    ax.set_xlabel("Reserves with variable debt")
+    ax.set_ylabel("Number of borrowers")
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# ### 2.3 Liquidation and repayment events
+#
+# `liquidationCalls` define one of the two triggers of `S7`; `repays` define `S1`. Both are keyed by the **borrower** (`user_id`) and the UTC date of the event. A snapshot is taken at the first block at or after 00:00 UTC of its date, so an event dated $d$ happens **after** snapshot $d$ and **before** snapshot $d+1$. Section 7 uses this timing to attach each event to a transition.
 #
 # The cell reports event counts and how many of them belong to a user present in the snapshot of the event day or the day before. The USD price fields of the events are unreliable (0 in 19-27% of liquidations) and are never used.
 
@@ -288,8 +439,11 @@ def load_events(scenario_dir: Path, scenario_key: str) -> tuple[pd.DataFrame, pd
         usecols=["timestamp", "date", "user_id", "reserve_symbol", "use_a_tokens"],
         **read_options,
     )
+    liquidations["date"] = pd.to_datetime(liquidations["date"])
+    repays["date"] = pd.to_datetime(repays["date"])
+    liquidations = restrict_to_window(liquidations, scenario_key, "liquidation_calls")
+    repays = restrict_to_window(repays, scenario_key, "repays")
     for frame in (liquidations, repays):
-        frame["date"] = pd.to_datetime(frame["date"])
         frame.insert(0, "scenario", scenario_key)
     return liquidations, repays
 
@@ -333,20 +487,21 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
 display(pd.DataFrame(event_records).set_index("scenario").T)
 
 # %% [markdown]
-# ## 6. Protocol parameters
+# ### 2.4 Protocol parameters
 #
-# LT, LB, LTV and the reserve eMode category come from `load_reserve_params(scenario, date)`, and the eMode category parameters from `load_emode_categories(scenario, date)`: the single source of protocol parameters. They change over time (for example UNI and LINK), which is why they are merged **by day** in Section 9. The table shows the LT of the reserves that matter for the profiles on the first day, on $t$ and on the last day of the window.
+# LT, LB, LTV and the reserve eMode category come from `load_reserve_params(scenario, date)`, and the eMode category parameters from `load_emode_categories(scenario, date)`: the single source of protocol parameters. They change over time (for example UNI and LINK), which is why they are merged **by day** in Section 3. The table shows the LT of the reserves that matter for the profiles on the first day, on $t$ and on the last day of the window.
 
 # %%
 reserve_params: dict[str, pd.DataFrame] = {}
 emode_categories: dict[str, pd.DataFrame] = {}
-PARAM_SYMBOLS = ["WETH", "wstETH", "rETH", "cbETH", "WBTC", "UNI", "LINK", "USDC", "USDT", "DAI"]
 
 for scenario_key, scenario_label in SCENARIO_KEYS:
     reserves = load_reserve_params(scenario_label, raw_dir=RAW_DATA_DIR)
     emodes = load_emode_categories(scenario_label, raw_dir=RAW_DATA_DIR)
     reserves["date"] = pd.to_datetime(reserves["date"])
     emodes["date"] = pd.to_datetime(emodes["date"])
+    reserves = restrict_to_window(reserves, scenario_key, "reserve_params")
+    emodes = restrict_to_window(emodes, scenario_key, "emode_categories")
     window = pd.date_range(DAY1_DATE[scenario_key], OOT_END_DATE[scenario_key], freq="D")
     assert set(window) <= set(reserves["date"]), f"{scenario_label}: reserve parameters miss window days."
     assert set(window) <= set(emodes["date"]), f"{scenario_label}: eMode parameters miss window days."
@@ -374,37 +529,7 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
     display(emodes_t)
 
 # %% [markdown]
-# ## 7. Daily universe
-#
-# Number of borrowers per day (all snapshot users, before any profile filter) and the number of reserves with debt per borrower on $t$. The universe changes from day to day, which is what the old extract could not show: the previous panel was built from a single set of users observed in 2026.
-
-# %%
-universe_by_day: dict[str, pd.Series] = {}
-fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
-for ax, (scenario_key, scenario_label) in zip(axes, SCENARIO_KEYS):
-    positions = positions_by_scenario[scenario_key]
-    universe = positions.groupby("date")["user_id"].nunique().rename("borrowers")
-    universe_by_day[scenario_key] = universe
-    assert universe.nunique() > 1, f"{scenario_label}: the universe does not change between days."
-    print(
-        f"[{scenario_key}] borrowers per day: min={universe.min():,} median={int(universe.median()):,} max={universe.max():,}"
-    )
-    display(universe.iloc[[0, 1, 2, T_IDX - 1, T_IDX, T_IDX + 1, LAST_IDX]].to_frame().T)
-
-    debt_reserves = (
-        positions.loc[(positions["date"] == VALUATION_DATE[scenario_key]) & (positions["variable_debt"] > 0)]
-        .groupby("user_id")
-        .size()
-    )
-    debt_reserves.value_counts().sort_index().plot(kind="bar", ax=ax, color="#4C72B0")
-    ax.set_title(f"{scenario_label}: reserves with debt per borrower on t")
-    ax.set_xlabel("Reserves with variable debt")
-    ax.set_ylabel("Number of borrowers")
-plt.tight_layout()
-plt.show()
-
-# %% [markdown]
-# ## 8. Aave oracle prices
+# ### 2.5 Aave oracle prices
 #
 # `prices/aave_oracle_daily.csv` holds the price that the protocol itself uses to liquidate (`AaveOracle.getAssetsPrices` at the daily block), for every reserve and day. It values the ETH liquid staking tokens at their own price (wstETH trades above ETH) and the stablecoins at their oracle price instead of a fixed $1.00. The cell checks that the key (date, asset) is unique, that the prices are positive, and that every asset held in the positions has a price on the day it is held.
 
@@ -417,6 +542,7 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
         dtype={"date": str, "symbol": str, "underlying_asset": str},
     )
     oracle["date"] = pd.to_datetime(oracle["date"])
+    oracle = restrict_to_window(oracle, scenario_key, "aave_oracle_daily")
     assert not oracle.duplicated(["date", "underlying_asset"]).any(), f"{scenario_label}: duplicated oracle rows."
     assert (oracle["price_usd"] > 0).all(), f"{scenario_label}: non-positive oracle prices."
     oracle_by_scenario[scenario_key] = oracle
@@ -437,7 +563,11 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
     )
 
 # %% [markdown]
-# ## 9. Daily USD valuation
+# # Part B. Panel
+#
+# The raw positions become the observation table of the chain: valuation in USD (Section 3), aggregation to one row per (wallet, day) with the profile flags and the Health Factor (Section 4), the minimum-debt panel (Section 5) and the purity filter (Section 6).
+#
+# ## 3. Daily USD valuation
 #
 # Each position row of a snapshot is valued with the oracle price **of its own day**:
 #
@@ -445,28 +575,9 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
 # - `debt_usd = (variable_debt + stable_debt) * price`.
 # - `lt` / `lb`: the reserve LT / LB of the day, or the **eMode category** LT / LB when the user's eMode id is $> 0$ and the reserve belongs to that category.
 #
-# Sub-microdollar residuals (`DUST_USD`) are treated as zero so that leftover wei does not contaminate the purity tests; this is a numerical floor and is unrelated to the repayment threshold `DUST_DEBT_USD` of Section 13. A position with a balance but no oracle price would be unvalued; the cell asserts that there is none, and that each valued price equals the price of `aave_oracle_daily.csv` for the same day.
+# Sub-microdollar residuals (`DUST_USD`) are treated as zero so that leftover wei does not contaminate the purity tests; this is a numerical floor and is unrelated to the repayment threshold `DUST_DEBT_USD` of Section 7. A position with a balance but no oracle price would be unvalued; the cell asserts that there is none, and that each valued price equals the price of `aave_oracle_daily.csv` for the same day.
 
 # %%
-ETH_CORE = {"WETH", "wstETH", "rETH", "cbETH", "weETH", "osETH", "ETHx"}  # WETH and ETH liquid staking tokens
-WBTC_SET = {"WBTC"}
-PROFILE_B_CORE = {"UNI", "LINK"}
-STABLE_SYMBOLS = {"USDC", "USDT", "DAI", "FRAX", "LUSD", "GHO", "PYUSD", "crvUSD", "USDe"}  # USD stablecoins (debt rule)
-STABLE_WRAPPERS = {"sDAI", "sUSDe"}  # yield-bearing wrappers of USD stablecoins: stable collateral, valued at the oracle price
-STABLE_COLLATERAL = STABLE_SYMBOLS | STABLE_WRAPPERS
-SYMBOL_GROUP = {
-    **{symbol: "eth_core" for symbol in ETH_CORE},
-    "WBTC": "wbtc",
-    "UNI": "uni",
-    "LINK": "link",
-    **{symbol: "stable" for symbol in STABLE_COLLATERAL},
-}
-GROUPS = ["eth_core", "wbtc", "uni", "link", "stable", "other"]
-DUST_USD = 1e-4
-AUDIT_SAMPLE_ROWS = 5000
-AUDIT_SEED = 20240315
-
-
 def value_scenario_positions(scenario_key: str) -> pd.DataFrame:
     """Value one scenario at row level and aggregate it to one row per (user, day)."""
     positions = positions_by_scenario[scenario_key]
@@ -562,7 +673,7 @@ del user_day_parts
 positions_by_scenario.clear()  # the row-level positions are not needed after the (user, day) aggregation
 
 # %% [markdown]
-# ## 10. Aggregation and actuarial dominance filters
+# ## 4. Aggregation, profile classification and Health Factor
 #
 # Positions are summed to the `(user_id, date)` level, keeping the collateral USD by asset group: ETH core (`eth_core_usd`: WETH and the ETH liquid staking tokens present in the data), `wbtc_usd`, `uni_usd`, `link_usd`, `stable_usd` and `other_usd` (any other reserve).
 #
@@ -572,12 +683,17 @@ positions_by_scenario.clear()  # the row-level positions are not needed after th
 #
 # **Profile B (UNI+LINK high-risk dominance):** at least 85% of `total_collateral_usd` in `UNI` + `LINK`. The residual (at most 15%) may only be stablecoins, WETH, ETH liquid staking tokens or WBTC.
 #
-# Only reserves enabled as collateral count. For the remainder rule and for `stable_usd`, **stable collateral** includes the yield-bearing wrappers of USD stablecoins present in the data (`STABLE_WRAPPERS`: sDAI, sUSDe), valued at their own oracle price. A wrapper is collateral only: it is not in the debt list, so a wallet that borrowed it would fail the debt rule (Aave does not list them as borrowable). The minimum debt of the panel is applied in Section 11.
+# Only reserves enabled as collateral count. For the remainder rule and for `stable_usd`, **stable collateral** includes the yield-bearing wrappers of USD stablecoins present in the data (`STABLE_WRAPPERS`: sDAI, sUSDe), valued at their own oracle price. A wrapper is collateral only: it is not in the debt list, so a wallet that borrowed it would fail the debt rule (Aave does not list them as borrowable). The minimum debt of the panel is applied in Section 5.
+#
+# **Health Factor.** For every user-day with debt:
+#
+# $$
+# HF_t = \frac{\sum_i (\text{Collateral USD}_{i,t} \times LT_{i,t})}{\text{Total Debt USD}_t}
+# $$
+#
+# $LT_{i,t}$ is the liquidation threshold of reserve $i$ **on day $t$**, taken from `load_reserve_params` (or the eMode category LT when the user is in eMode and the reserve belongs to the category). The same weights give the collateral-weighted liquidation threshold `lt_w` and bonus `lb_w` that the LGD module needs.
 
 # %%
-DOMINANCE_THRESHOLD = 0.85
-
-
 def classify_dominance(users: pd.DataFrame) -> pd.DataFrame:
     """Add shares, profile flags, Health Factor and weighted LT / LB to the (user, day) table."""
     out = users.copy()
@@ -590,7 +706,7 @@ def classify_dominance(users: pd.DataFrame) -> pd.DataFrame:
     a_disallowed = (out["other_usd"] + out["uni_usd"] + out["link_usd"]) > 0
     b_disallowed = out["other_usd"] > 0
 
-    debt_ok = (out["total_debt_usd"] > 0) & (out["stable_debt_usd"] >= out["total_debt_usd"] * (1.0 - 1e-8))
+    debt_ok = (out["total_debt_usd"] > 0) & (out["stable_debt_usd"] >= out["total_debt_usd"] * (1.0 - STABLE_DEBT_TOLERANCE))
     base = debt_ok & has_collateral & ~out["has_unpriced"]
     out["is_profile_a"] = base & ~a_disallowed & (out["eth_share"] >= DOMINANCE_THRESHOLD)
     out["is_profile_b"] = base & ~b_disallowed & (out["high_risk_share"] >= DOMINANCE_THRESHOLD)
@@ -604,7 +720,7 @@ def classify_dominance(users: pd.DataFrame) -> pd.DataFrame:
 
 user_day = classify_dominance(user_day)
 
-# Integer indices shared by every table below (see Section 2).
+# Integer indices shared by every table below (see Section 1).
 wallet_labels = user_day["scenario"] + "|" + user_day["user_id"]
 user_day["wid"], WALLET_UNIQUES = pd.factorize(wallet_labels)
 WALLET_LOOKUP = pd.Series(np.arange(len(WALLET_UNIQUES), dtype="int64"), index=WALLET_UNIQUES)
@@ -613,7 +729,7 @@ user_day["key"] = user_day["wid"].astype("int64") * DAY_STRIDE + user_day["day"]
 user_day = user_day.sort_values("key", kind="mergesort").reset_index(drop=True)
 assert user_day["key"].is_unique, "Duplicated (wallet, day) keys."
 
-# Lookup arrays over ALL snapshot borrowers (not only profile wallets), used by Sections 14 and 18.
+# Lookup arrays over ALL snapshot borrowers (not only profile wallets), used by Sections 8, 9 and 15.
 UD_INDEX = pd.Index(user_day["key"].to_numpy())
 UD_DEBT = user_day["total_debt_usd"].to_numpy()
 UD_HF = user_day["health_factor"].to_numpy()
@@ -628,22 +744,15 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
     )
 
 # %% [markdown]
-# ## 11. Empirical Health Factor
+# ## 5. Minimum debt and the profile panel
 #
-# For qualifying user-days in both scenarios:
+# In both scenarios the panel keeps the user-days that satisfy Profile A and/or B (Section 4) **and** carry at least `MIN_DEBT_USD` of debt.
 #
-# $$
-# HF_t = \frac{\sum_i (\text{Collateral USD}_{i,t} \times LT_{i,t})}{\text{Total Debt USD}_t}
-# $$
-#
-# $LT_{i,t}$ is the liquidation threshold of reserve $i$ **on day $t$**, taken from `load_reserve_params` (or the eMode category LT when the user is in eMode and the reserve belongs to the category). The same weights give the collateral-weighted liquidation threshold `lt_w` and bonus `lb_w` that the LGD module needs.
-#
-# **Minimum debt.** A user-day enters the profile panel only if `total_debt_usd >= MIN_DEBT_USD` (USD 100). Smaller positions are dust that liquidators ignore, and the previous diagnostic showed that the wallets stuck at $HF \le 1$ were almost all dust. A USD 1,000 minimum is reported as a sensitivity in Section 17.5.
+# **Minimum debt.** A user-day enters the profile panel only if `total_debt_usd >= MIN_DEBT_USD` (USD 100). Smaller positions are dust that liquidators ignore, and the previous diagnostic showed that the wallets stuck at $HF \le 1$ were almost all dust. A USD 1,000 minimum is reported as a sensitivity in Section 14.
 #
 # If a user-day matches both profiles (not possible with an 85% threshold), it is labelled `A+B`. Wallet counts below use `.value_counts()` on the distinct profile labels of the surviving wallets.
 
 # %%
-MIN_DEBT_USD = 100.0
 PANEL_COLUMNS = [
     "scenario", "user_id", "wid", "date", "day", "key", "profile", "is_profile_a", "is_profile_b",
     "total_collateral_usd", "total_debt_usd", "thr_weighted_collateral_usd", "health_factor", "lt_w", "lb_w",
@@ -690,7 +799,7 @@ print("Combined HF panel (head):")
 display(hf_panel_df.head())
 
 # %% [markdown]
-# ## 12. Purity filter
+# ## 6. Purity filter
 #
 # This section starts from `hf_panel_df` and builds the pure wallet panel:
 #
@@ -733,7 +842,11 @@ print(
 )
 
 # %% [markdown]
-# ## 13. Current-state mapping
+# # Part C. States and trajectories
+#
+# Each observation of the pure panel receives a state (Section 7); the interval to the next snapshot ends in an absorbing state, a transient state or no transition (Section 8); the resulting sample sizes, exit reasons and the informative-censoring check are verified in Section 9.
+#
+# ## 7. Current-state mapping
 #
 # Every observation (pure wallet, day in the filter) receives a **state**:
 #
@@ -745,7 +858,7 @@ print(
 # | S5 | $1.10 \le HF < 1.25$ |
 # | S6 | $1.0 < HF < 1.10$ |
 # | **S7** | **liquidation event (technical default)**: $HF \le 1$ in the day's snapshot (`S7_hf`) **or** a `liquidationCall` on the wallet in the snapshot interval ending that day (`S7_liquidation_call`) |
-# | **S1** | **observed repayment**: it is never the state of an observation, only the *next* state of a wallet that repaid (Section 14) |
+# | **S1** | **observed repayment**: it is never the state of an observation, only the *next* state of a wallet that repaid (Section 8) |
 #
 # `pd.cut` assigns bins with a closed right edge. The single boundary $HF == 1.10$ is remapped from `S6` to `S5` so that the target band is $1.10 \le HF < 1.25$ and the critical band is $1.0 < HF < 1.10$.
 #
@@ -754,20 +867,6 @@ print(
 # **Repayment threshold.** `DUST_DEBT_USD = 1.0`: a repay event followed by a total debt of at most USD 1 (or by the wallet disappearing from the next snapshot) is `S1`.
 
 # %%
-DUST_DEBT_USD = 1.0  # S1: total debt after a repay event is <= this amount (USD)
-# An event dated d belongs to the transition (d - offset) -> (d - offset + 1); see the text above.
-LIQUIDATION_DAY_OFFSET = 0  # 0: events dated d -> transition d -> d+1 (causal); 1: same-day variant
-REPAY_DAY_OFFSET = 0  # keep at 0: S1 is read from the next snapshot
-LIQUIDATION_HF_THRESHOLD = 1.0
-
-HF_STATE_BINS = [-np.inf, 1.0, 1.10, 1.25, 1.50, 2.0, np.inf]
-HF_STATE_LABELS = ["S7", "S6", "S5", "S4", "S3", "S2"]
-STATE_ORDER = ["S1", "S2", "S3", "S4", "S5", "S6", "S7"]
-TRANSIENT_STATES = ["S2", "S3", "S4", "S5", "S6"]
-ABSORBING_STATES = ["S1", "S7"]
-EXIT_REASONS = ["S1_repay", "S7_hf", "S7_liquidation_call", "censored_filter_exit", "censored_window_end"]
-
-
 def map_health_factor_to_state(health_factor: pd.Series) -> pd.Series:
     """Map Health Factor to the HF-based states S2-S7 (the liquidationCall trigger is added below)."""
     state = pd.cut(
@@ -845,7 +944,7 @@ for (scenario_key, profile), block in calibration_states.groupby(["scenario", "p
     )
 
 # %% [markdown]
-# ## 14. Absorbing states, censoring and transitions without gaps
+# ## 8. Absorbing states, censoring and transitions without gaps
 #
 # The old notebook inferred `S1` from a wallet disappearing and forward-filled the first absorbing state to the end of the window. Both are replaced by observed events.
 #
@@ -856,9 +955,9 @@ for (scenario_key, profile), block in calibration_states.groupby(["scenario", "p
 # 3. **A transient state** $S_j$: the wallet is observed on $d+1$, in the filter and not absorbed.
 # 4. **No transition**: the wallet is not observed on $d+1$ and nothing explains it (a gap, or a filter exit).
 #
-# **Absorbing, not censored.** `S1` and `S7` are absorbing by definition. The entry transition $S_i(d) \to S1/S7(d+1)$ is counted once and the trajectory **ends** at the first hit: nothing is forward-filled. A trajectory that is observed for the first time already in `S7` ($HF \le 1$) ends there without an entry transition. Section 16 sets the `S1` and `S7` rows of $\mathbf{P}$ to the identity by definition, and their rows of $\mathbf{N}$ stay at 0.
+# **Absorbing, not censored.** `S1` and `S7` are absorbing by definition. The entry transition $S_i(d) \to S1/S7(d+1)$ is counted once and the trajectory **ends** at the first hit: nothing is forward-filled. A trajectory that is observed for the first time already in `S7` ($HF \le 1$) ends there without an entry transition. Section 10 sets the `S1` and `S7` rows of $\mathbf{P}$ to the identity by definition, and their rows of $\mathbf{N}$ stay at 0.
 #
-# **Spells.** A repayment closes a *spell*: if the wallet borrows again inside the window, its next observation opens a **new spell**, a new trajectory that counts as a late entrant from its re-entry day (`spell_id`, internal key `sid = wid * 16 + spell`). `exit_reason` is therefore reported per spell, and the number of spells is the number of wallets plus the re-entries after `S1`. After `S7` the wallet is **not followed again** inside the window (project rule): its later observations are ignored for $\mathbf{N}$ and the cell reports how many there are. The bootstrap of Section 17.2 still resamples wallets, so that all the spells of a wallet stay together.
+# **Spells.** A repayment closes a *spell*: if the wallet borrows again inside the window, its next observation opens a **new spell**, a new trajectory that counts as a late entrant from its re-entry day (`spell_id`, internal key `sid = wid * 16 + spell`). `exit_reason` is therefore reported per spell, and the number of spells is the number of wallets plus the re-entries after `S1`. After `S7` the wallet is **not followed again** inside the window (project rule): its later observations are ignored for $\mathbf{N}$ and the cell reports how many there are. The bootstrap of Section 11 still resamples wallets, so that all the spells of a wallet stay together.
 #
 # **Transitions only between consecutive observed days ($\Delta = 1$ day).** A transition that crosses a gap is not counted and no state is carried over, but the wallet resumes contributing from its next pair of consecutive days.
 #
@@ -867,15 +966,11 @@ for (scenario_key, profile), block in calibration_states.groupby(["scenario", "p
 # - `censored_filter_exit`: the wallet leaves the profile filter (debt under the minimum, a different collateral mix, a different label) with debt $> 0$ and **never returns** inside the window.
 # - `censored_window_end`: the wallet is still transient on $t$.
 #
-# `exit_reason` takes five values: `S1_repay`, `S7_hf`, `S7_liquidation_call`, `censored_filter_exit`, `censored_window_end`. Section 15 compares the Health Factor at censoring with the other wallets to look for informative censoring.
+# `exit_reason` takes five values: `S1_repay`, `S7_hf`, `S7_liquidation_call`, `censored_filter_exit`, `censored_window_end`. Section 9 compares the Health Factor at censoring with the other wallets to look for informative censoring.
 #
-# The same function runs over the 61 days. Calibration only keeps landings on day $\le t$; the out-of-time outcome of Section 18 uses the landings in $(t, t+30]$.
+# The same function runs over the 61 days. Calibration only keeps landings on day $\le t$; the out-of-time outcome of Section 15 uses the landings in $(t, t+30]$.
 
 # %%
-ABSORBING_PRIORITY = {"S7_hf": 0, "S7_liquidation_call": 1, "S1_repay": 2}
-SPELL_STRIDE = 16  # at most 16 spells per wallet (repay, borrow again, ...); sid = wid * SPELL_STRIDE + spell
-
-
 def lookup_snapshot(values: np.ndarray, query_keys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Value of the all-borrowers snapshot table at each (wid, day) key, and whether the key exists."""
     position = UD_INDEX.get_indexer(query_keys)
@@ -886,7 +981,7 @@ def lookup_snapshot(values: np.ndarray, query_keys: np.ndarray) -> tuple[np.ndar
 
 
 def build_trajectories(obs: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Apply the Section 14 rules: outcome of every interval ``d -> d+1`` and the absorbing events.
+    """Apply the Section 8 rules: outcome of every interval ``d -> d+1`` and the absorbing events.
 
     Returns the observation table with the interval outcome of each row and the table of absorbing
     events ``(wid, landing day, type)``: the day on which a wallet enters S1 or S7.
@@ -1048,7 +1143,7 @@ def counted_transitions(trajectories: dict[str, pd.DataFrame], summary: pd.DataF
 
 
 def run_chain(panel: pd.DataFrame) -> dict:
-    """Section 13 and 14 end to end for any observation panel (used by the sensitivities of Section 17)."""
+    """Sections 7 and 8 end to end for any observation panel (used by the sensitivities of Part E)."""
     trajectories = build_trajectories(assign_day_states(panel))
     summary = summarise_wallets(trajectories)
     return {"traj": trajectories, "summary": summary, "transitions": counted_transitions(trajectories, summary)}
@@ -1096,9 +1191,9 @@ zombie = markov_transitions_df["state"].isin(ABSORBING_STATES)
 print(f"Transitions out of absorbing states (should be 0): {int(zombie.sum()):,}")
 
 # %% [markdown]
-# ## 15. Sample-size verification
+# ## 9. Sample size and informative censoring
 #
-# Cross-sectional `state` counts (wallet-days that belong to a trajectory), the `exit_reason` of every spell, and the empirical $t \to t+1$ pair counts ($\mathbf{N}$) are reported **separately** for each market regime (`baseline_mar2024`, `stress_aug2024`) and collateral profile (A, B), before assembling the transition matrices. The cell also asserts the rules of Section 14 against the raw events:
+# Cross-sectional `state` counts (wallet-days that belong to a trajectory), the `exit_reason` of every spell, and the empirical $t \to t+1$ pair counts ($\mathbf{N}$) are reported **separately** for each market regime (`baseline_mar2024`, `stress_aug2024`) and collateral profile (A, B), before assembling the transition matrices. The cell also asserts the rules of Section 8 against the raw events:
 #
 # - `exit_reason` counts (one per spell) add up to the number of spells, and the spells belong to the pure wallets;
 # - no transition spans more than one day, and no transition leaves an absorbing state or follows the first absorption;
@@ -1108,13 +1203,15 @@ print(f"Transitions out of absorbing states (should be 0): {int(zombie.sum()):,}
 # **Informative-censoring check.** If wallets left the filter *because* they were close to liquidation, ignoring them would bias $\mathbf{P}$. The table compares the Health Factor of the last observation of `censored_filter_exit` wallets with the other exit reasons (for absorbed wallets: the last observation before the event) and tests it against `censored_window_end` with a Kolmogorov-Smirnov test. `exit_detail` shows what happened to a filter-exit wallet on the day after its last observation.
 
 # %%
-SCENARIO_PRINT_ORDER = ["baseline", "stress"]
-PROFILE_PRINT_ORDER = ["A", "B"]
-PROFILE_KEYS = ["A", "B"]
-PROFILE_TITLES = {
-    "A": "Profile A (ETH dominance)",
-    "B": "Profile B (UNI+LINK dominance)",
-}
+def ks_two_sample(first: pd.Series, second: pd.Series) -> tuple[float, float]:
+    """Two-sample Kolmogorov-Smirnov statistic and its asymptotic p-value (``scipy.special`` only)."""
+    a, b = np.sort(first.to_numpy(dtype=float)), np.sort(second.to_numpy(dtype=float))
+    grid = np.concatenate([a, b])
+    gap = np.abs(np.searchsorted(a, grid, side="right") / len(a) - np.searchsorted(b, grid, side="right") / len(b))
+    statistic = float(gap.max())
+    effective_n = np.sqrt(len(a) * len(b) / (len(a) + len(b)))
+    return statistic, float(kolmogorov(effective_n * statistic))
+
 
 print("=== Current-state distribution by scenario and profile (wallet-days in a trajectory) ===")
 for (scenario, profile), block in markov_states_df.groupby(["scenario", "profile"], sort=False):
@@ -1274,19 +1371,117 @@ print(
 )
 
 # %% [markdown]
-# ## 16. Empirical transition matrices
+# ### 9.1 Diagnostic: S7 outcomes without an entry transition in N
+#
+# The in-sample backtest of Section 15 reads the calibration outcome of the day-1 cohort (`final_state`), whereas $\mathbf{N}$ counts only transitions between two consecutive observed days. The two can disagree. In the full baseline run the profile-B day-1 cohort has wallets with `final_state = S7`, yet the profile-B matrix has no transition into `S7`. The cell classifies every spell that ends in `S7` by whether $\mathbf{N}$ sees its entry and, if not, by what the wallet looked like on the **origin day** (the day before the landing day). Two mechanisms produce an `S7` without an entry transition:
+#
+# 1. **The spell starts already in `S7`** (HF $\le 1$ on its first observed day, or a liquidation that precedes its first observation): there is no origin observation (Section 8).
+# 2. **The origin day is not an observation of the wallet.** The `liquidationCall` trigger is attached to the landing observation through the wallet's events whether or not the wallet was in the profile filter on the origin day (Section 7), while $\mathbf{N}$ needs two consecutive observed days (Section 8). A wallet that is outside the filter on the origin day (no position, debt under the minimum or not in stablecoins, the other profile label, a collateral mix that matches neither profile) and is back in the filter on the landing day closes its spell in `S7` without a transition. In the full baseline run (checked on the raw positions) the one profile-B day-1 wallet that ends in `S7` through a `liquidationCall` is of this type: it held LINK against USDT on day 1, added WETH until it was about half of the collateral, so it was neither A nor B when it was liquidated on 2024-03-05; the liquidation seized WETH and the wallet was a profile-B wallet again, already in `S7`, on 2024-03-06. The other two profile-B wallets are of the first type (HF $\le 1$ on day 1, debts under USD 1,000).
+#
+# This is a consequence of the rules, not an implementation error: such outcomes count in the day-1 cohort and never enter $\mathbf{N}$ or the PD. The in-sample backtest should therefore report them separately or leave them out of the observed `S7` count.
+
+# %%
+S7_TYPES = ["S7_hf", "S7_liquidation_call"]
+S7_REASON_TEXT = {
+    "entry_transition_in_N": "counted in N: the wallet was observed in a transient state on the origin day",
+    "first_observation_is_S7": "the spell starts already in S7 (no origin observation)",
+    "origin_day_not_in_snapshot": "the wallet has no position in the snapshot of the origin day",
+    "origin_debt_below_min": "the debt on the origin day is under MIN_DEBT_USD",
+    "origin_debt_not_stablecoin": "the debt on the origin day is not 100% in stablecoins",
+    "origin_other_profile_label": "on the origin day the wallet shows the other profile label",
+    "origin_collateral_mix_outside_profile": "on the origin day the collateral mix matches neither profile (dominance under 85% or a disallowed asset)",
+    "origin_in_panel_UNEXPECTED": "the origin day is in the panel but no transition was counted (should not happen)",
+}
+
+s7_spells = wallet_summary.loc[wallet_summary["type"].isin(S7_TYPES)].copy()
+s7_spells["landing"] = s7_spells["landing"].astype("int64")  # landing day of a spell that ends in S7
+entry_sids = markov_transitions_df.loc[markov_transitions_df["next_state"] == "S7", "sid"].unique()
+entry_in_n = s7_spells.index.isin(entry_sids)
+
+# State of the wallet in the all-borrowers snapshot on the origin day (the day before the landing day).
+origin_keys = s7_spells["wid"].to_numpy().astype("int64") * DAY_STRIDE + s7_spells["landing"].to_numpy().astype("int64") - 1
+snapshot_columns = ["total_debt_usd", "stable_debt_usd", "is_profile_a", "is_profile_b", "eth_share", "high_risk_share"]
+origin = user_day.set_index("key")[snapshot_columns].reindex(origin_keys)
+origin.index = s7_spells.index
+
+in_snapshot = origin["total_debt_usd"].notna().to_numpy()
+origin_debt = origin["total_debt_usd"].to_numpy(dtype=float)
+origin_stable_debt = origin["stable_debt_usd"].to_numpy(dtype=float)
+is_wallet_a = s7_spells["profile"].to_numpy() == "A"
+own_label = np.where(is_wallet_a, origin["is_profile_a"].eq(True), origin["is_profile_b"].eq(True))
+other_label = np.where(is_wallet_a, origin["is_profile_b"].eq(True), origin["is_profile_a"].eq(True))
+first_observation_is_s7 = (s7_spells["first_day"] == s7_spells["landing"]).to_numpy()
+
+s7_spells["entry_class"] = np.select(
+    [
+        entry_in_n,
+        first_observation_is_s7,
+        ~in_snapshot,
+        origin_debt < MIN_DEBT_USD,
+        origin_stable_debt < origin_debt * (1.0 - STABLE_DEBT_TOLERANCE),
+        other_label & ~own_label,
+        ~own_label,
+    ],
+    [
+        "entry_transition_in_N",
+        "first_observation_is_S7",
+        "origin_day_not_in_snapshot",
+        "origin_debt_below_min",
+        "origin_debt_not_stablecoin",
+        "origin_other_profile_label",
+        "origin_collateral_mix_outside_profile",
+    ],
+    default="origin_in_panel_UNEXPECTED",
+)
+s7_spells["origin_debt_usd"] = origin["total_debt_usd"]
+s7_spells["origin_eth_share"] = origin["eth_share"]
+s7_spells["origin_uni_link_share"] = origin["high_risk_share"]
+
+print("Spells that end in S7 (calibration window), by segment and by what N sees:")
+display(pd.crosstab([s7_spells["scenario"], s7_spells["profile"]], s7_spells["entry_class"]))
+
+detail_columns = [
+    "scenario", "profile", "user_id", "first_day", "landing", "type", "entry_class",
+    "origin_debt_usd", "origin_eth_share", "origin_uni_link_share",
+]  # fmt: skip
+no_entry_day1 = s7_spells.loc[(s7_spells["first_day"] == 0) & (s7_spells["entry_class"] != "entry_transition_in_N"), detail_columns]
+print(f"\nDay-1 cohort wallets that end in S7 without an entry transition in N: {len(no_entry_day1):,}")
+if len(no_entry_day1):
+    display(no_entry_day1.round(3).reset_index(drop=True))
+
+n_into_s7 = markov_transitions_df.loc[markov_transitions_df["next_state"] == "S7"].groupby(["scenario", "profile"]).size()
+print("\nExplanation by segment (S7 outcomes that N does not see):")
+for (scenario_key, profile), block in s7_spells.groupby(["scenario", "profile"]):
+    unseen = block.loc[block["entry_class"] != "entry_transition_in_N"]
+    if unseen.empty:
+        continue
+    print(
+        f"  {SCENARIO_LABEL[scenario_key]} | Profile {profile}: {len(block)} spell(s) end in S7, N has "
+        f"{int(n_into_s7.get((scenario_key, profile), 0))} transition(s) into S7; {len(unseen)} S7 outcome(s) without an entry transition:"
+    )
+    for reason_name, count in unseen["entry_class"].value_counts().items():
+        print(f"      {count} x {reason_name}: {S7_REASON_TEXT[reason_name]}")
+n_unexpected = int((s7_spells["entry_class"] == "origin_in_panel_UNEXPECTED").sum())
+print(f"\nS7 spells whose origin day is in the panel but have no counted transition (should be 0): {n_unexpected}")
+print(
+    "Why: a liquidationCall marks S7 on the landing observation whether or not the wallet was in the profile filter on the origin day, "
+    "while N needs two consecutive observed days. These outcomes count in the day-1 cohort (Section 15) but never in N or the PD."
+)
+
+# %% [markdown]
+# # Part D. Estimation
+#
+# From the calibration transitions `markov_transitions_df` (always split by market regime, `baseline_mar2024` and `stress_aug2024`, and collateral profile, A and B): the count matrices $\mathbf{N}$ and the row-stochastic daily matrices $\mathbf{P}$ (Section 10), and the 30-day projection $\mathbf{P}^{30}$, the PD $[\mathbf{P}^{30}]_{i,S7}$ and its wallet-level bootstrap intervals (Section 11).
+#
+# ## 10. Empirical transition matrices N and P
+#
+# ### 10.1 Daily matrices
 #
 # Four daily count matrices $\mathbf{N}$ and probability matrices $\mathbf{P}$ are assembled from `transition_pair` in the calibration transitions: one per market regime (`baseline_mar2024`, `stress_aug2024`) and collateral profile (A, B).
 #
 # Rows and columns follow `STATE_ORDER`. Each transient row (S2-S6) is normalized by its sum. **The rows of `S1` and `S7` are set to the identity by definition** ($P_{S1,S1} = P_{S7,S7} = 1$): they are absorbing states, so no transition out of them is ever observed and their rows of $\mathbf{N}$ are 0 (the old notebook obtained them from forward-filled frozen paths). A transient row with no observed transition cannot be estimated; it takes the identity so that $\mathbf{P}$ stays row-stochastic, and it is flagged in the printout (its `n` is 0, `row_empty` is `True` in the export, and its $\mathbf{P}^{30}$ row is left empty there).
 
 # %%
-STATE_INDEX = {state: idx for idx, state in enumerate(STATE_ORDER)}
-N_STATES = len(STATE_ORDER)
-ABSORBING_IDX = [STATE_INDEX[state] for state in ABSORBING_STATES]
-S7_STATE_IDX = STATE_INDEX["S7"]
-
-
 def row_normalize(counts: np.ndarray, empty_value: float) -> np.ndarray:
     """Row-normalize stacked count matrices (..., K, K); empty rows take empty_value."""
     row_totals = counts.sum(axis=-1, keepdims=True)
@@ -1332,6 +1527,12 @@ def unobserved_origin_states(counts_n: pd.DataFrame) -> list[str]:
     return [state for state in TRANSIENT_STATES if counts_n.loc[state].sum() == 0]
 
 
+def subset_transitions(transitions: pd.DataFrame, scenario_key: str, profile: str) -> pd.DataFrame:
+    """Return the transitions of one market regime and collateral profile."""
+    mask = transitions["scenario"].eq(scenario_key) & transitions["profile"].eq(profile)
+    return transitions.loc[mask]
+
+
 empirical_N: dict[tuple[str, str], pd.DataFrame] = {}
 empirical_P: dict[tuple[str, str], pd.DataFrame] = {}
 fig, axes = plt.subplots(2, 2, figsize=(14, 12))
@@ -1340,10 +1541,9 @@ axes = axes.ravel()
 plot_idx = 0
 for scenario_key, scenario_label in SCENARIO_KEYS:
     for profile in PROFILE_KEYS:
-        subset = markov_transitions_df.loc[
-            (markov_transitions_df["scenario"] == scenario_key) & (markov_transitions_df["profile"] == profile)
-        ].copy()
+        subset = subset_transitions(markov_transitions_df, scenario_key, profile)
         counts_n, transition_p = build_empirical_transition_matrices(subset)
+        counts_n = counts_n.astype(int).rename_axis(index="current_state", columns="next_state")
         empirical_N[(scenario_label, profile)] = counts_n
         empirical_P[(scenario_label, profile)] = transition_p
         assert np.allclose(transition_p.sum(axis=1), 1.0), "A row of P does not sum to 1."
@@ -1379,43 +1579,15 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# ## 17. Statistical robustness validation (actuarial audit)
+# ### 10.2 Absolute frequency matrices N
 #
-# The empirical daily matrices in Section 16 are point estimates. This section adds five audit checks on the calibration transitions `markov_transitions_df`, always split by market regime (`baseline_mar2024`, `stress_aug2024`) and collateral profile (A, B):
-#
-# 1. **Absolute frequency matrices $\mathbf{N}$**: the sample depth behind every probability.
-# 2. **Wallet-level bootstrap**: 95% confidence intervals for the one-step probability of a liquidation event $P_{i,S7}$ and for the 30-day PD implied by $\mathbf{P}^{30}$.
-# 3. **Time homogeneity**: $\mathbf{P}$ estimated on days 1-15 versus days 16-30, with a likelihood-ratio test per origin state.
-# 4. **Threshold sensitivity**: $\mathbf{P}$ re-estimated after shifting the intermediate Health Factor cut points by $\pm 0.05$.
-# 5. **Minimum-debt sensitivity**: transition counts and 30-day PD by origin state with a USD 1,000 minimum debt instead of USD 100.
-#
-# The cells reuse `STATE_ORDER`, `SCENARIO_KEYS`, `PROFILE_KEYS`, `PROFILE_TITLES`, and `build_empirical_transition_matrices` from Section 16, `run_chain` from Section 14, and `HF_STATE_BINS` / `HF_STATE_LABELS` from Section 13.
-
-# %% [markdown]
-# ### 17.1 Absolute frequency matrices N
-#
-# Rows are the state at day $t$ and columns the state at $t+1$, both ordered `S1` to `S7`. Row totals give the number of observed transitions behind each row of $\mathbf{P}$; the `S1` and `S7` rows are 0 by construction. Origin states with fewer than `MIN_ROW_DEPTH` transitions are flagged as thin; their probabilities should be read together with the bootstrap intervals in 17.2.
+# Rows are the state at day $t$ and columns the state at $t+1$, both ordered `S1` to `S7`. Row totals give the number of observed transitions behind each row of $\mathbf{P}$; the `S1` and `S7` rows are 0 by construction. Origin states with fewer than `MIN_ROW_DEPTH` transitions are flagged as thin; their probabilities should be read together with the bootstrap intervals of Section 11.
 
 # %%
-MIN_ROW_DEPTH = 30
-
-
-def subset_transitions(transitions: pd.DataFrame, scenario_key: str, profile: str) -> pd.DataFrame:
-    """Return the transitions of one market regime and collateral profile."""
-    mask = transitions["scenario"].eq(scenario_key) & transitions["profile"].eq(profile)
-    return transitions.loc[mask]
-
-
-absolute_N: dict[tuple[str, str], pd.DataFrame] = {}
-
 for scenario_key, scenario_label in SCENARIO_KEYS:
     for profile in PROFILE_KEYS:
         subset = subset_transitions(markov_transitions_df, scenario_key, profile)
-        counts_n, _ = build_empirical_transition_matrices(subset)
-        counts_n = counts_n.astype(int)
-        counts_n.index.name = "current_state"
-        counts_n.columns.name = "next_state"
-        absolute_N[(scenario_label, profile)] = counts_n
+        counts_n = empirical_N[(scenario_label, profile)]
 
         frequency_table = counts_n.copy()
         frequency_table["row_total"] = frequency_table.sum(axis=1)
@@ -1435,21 +1607,75 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
             print(f"  Thin origin states (< {MIN_ROW_DEPTH} transitions): {thin_text}")
 
 # %% [markdown]
-# ### 17.2 Wallet-level bootstrap confidence intervals
+# ## 11. 30-day horizon: P^30, PD and bootstrap confidence intervals
+#
+# ### 11.1 Projection P^30 and PD by origin state
+#
+# The 30-day matrix is the matrix power of the daily matrix, $\mathbf{P}^{30}$, and the PD of an origin state $i$ is the probability of having reached the liquidation event: $\text{PD}_i = [\mathbf{P}^{30}]_{i,S7}$. Every projection of the notebook (the point estimate, each bootstrap replicate, the sensitivities of Part E and the round trip of the export) goes through `project_horizon`, which applies `np.linalg.matrix_power` to a single matrix or to a stack of matrices. `compute_horizon_matrix` wraps it with shape and finiteness checks, and `validate_horizon_matrix` checks that the result is stochastic and that its `S7` column equals `horizon_pd`. A transient row without observed transitions is an identity row of $\mathbf{P}$ (Section 10) and is not an estimate.
+
+# %%
+def project_horizon(daily: np.ndarray, horizon_days: int = HORIZON_DAYS) -> np.ndarray:
+    """Horizon projection P^horizon_days of a daily matrix (K, K) or of a stack of matrices (..., K, K)."""
+    if horizon_days < 1:
+        raise ValueError(f"horizon_days must be a positive integer, got {horizon_days}.")
+    return np.linalg.matrix_power(daily, horizon_days)
+
+
+def horizon_pd(transition_p: pd.DataFrame, horizon_days: int = HORIZON_DAYS) -> pd.Series:
+    """Cumulative probability of reaching S7 within horizon_days, by origin state."""
+    power = project_horizon(transition_p.to_numpy(), horizon_days)
+    return pd.Series(power[:, S7_STATE_IDX], index=transition_p.index)
+
+
+def compute_horizon_matrix(transition_p: pd.DataFrame, horizon_days: int = HORIZON_DAYS) -> pd.DataFrame:
+    """Return the full horizon_days-step transition matrix P^horizon_days."""
+    if list(transition_p.index) != STATE_ORDER or list(transition_p.columns) != STATE_ORDER:
+        raise ValueError("Daily transition matrix rows and columns must follow STATE_ORDER.")
+    daily = transition_p.to_numpy(dtype=float)
+    if not np.isfinite(daily).all():
+        raise ValueError("Daily transition matrix contains non-finite values.")
+    return pd.DataFrame(
+        project_horizon(daily, horizon_days),
+        index=pd.Index(STATE_ORDER, name="current_state"),
+        columns=STATE_ORDER,
+    )
+
+
+def validate_horizon_matrix(
+    horizon_p: pd.DataFrame, daily_p: pd.DataFrame, segment: str, horizon_days: int = HORIZON_DAYS, tolerance: float = STOCHASTIC_TOLERANCE
+) -> None:
+    """Raise if P^horizon_days is not a valid stochastic matrix consistent with ``horizon_pd``."""
+    values = horizon_p.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError(f"{segment}: P^{horizon_days} contains non-finite values.")
+    if (values < -tolerance).any():
+        raise ValueError(f"{segment}: P^{horizon_days} contains negative probabilities.")
+    if not np.allclose(values.sum(axis=1), 1.0, atol=tolerance):
+        raise ValueError(f"{segment}: P^{horizon_days} rows do not sum to 1.")
+    reference_pd = horizon_pd(daily_p, horizon_days).to_numpy(dtype=float)
+    if not np.allclose(values[:, S7_STATE_IDX], reference_pd, atol=tolerance):
+        raise AssertionError(f"{segment}: S7 column does not match horizon_pd.")
+
+
+empirical_P30: dict[tuple[str, str], pd.DataFrame] = {}
+for scenario_key, scenario_label in SCENARIO_KEYS:
+    for profile in PROFILE_KEYS:
+        daily_p = empirical_P[(scenario_label, profile)]
+        horizon_p = compute_horizon_matrix(daily_p)
+        validate_horizon_matrix(horizon_p, daily_p, f"{scenario_label} | {profile}")
+        empirical_P30[(scenario_label, profile)] = horizon_p
+print(f"P^{HORIZON_DAYS} computed and validated for {len(empirical_P30)} segments (stochastic rows, S7 column equal to horizon_pd).")
+
+# %% [markdown]
+# ### 11.2 Wallet-level bootstrap confidence intervals
 #
 # Daily transitions of the same wallet are serially dependent, so resampling individual transitions would understate the variance. The bootstrap resamples **wallets** (the cluster) with replacement and keeps each wallet's full path.
 #
 # Implementation: each wallet's transitions are compressed into a 7x7 count vector $C_w$. A replicate draws multinomial weights $w \sim \text{Multinomial}(n, 1/n)$ over the $n$ wallets, which is equivalent to sampling `user_id` with replacement, and its count matrix is $\sum_w w_w C_w$. All $B = 500$ replicates are obtained with a single matrix product. In every replicate the `S1` and `S7` rows are the identity by definition.
 #
-# For each origin state the table reports the point estimate and the 2.5% / 97.5% percentiles of the one-step probability $P_{i,S7}$ of a liquidation event, plus the same interval for the 30-day PD $[\mathbf{P}^{30}]_{i,S7}$. Replicates in which an origin state is never visited are excluded from that row's daily percentiles (`n_valid_draws`); for the 30-day PD such a row follows the Section 16 convention (an identity row).
+# For each origin state the table reports the point estimate and the 2.5% / 97.5% percentiles of the one-step probability $P_{i,S7}$ of a liquidation event, plus the same interval for the 30-day PD $[\mathbf{P}^{30}]_{i,S7}$. Replicates in which an origin state is never visited are excluded from that row's daily percentiles (`n_valid_draws`); for the 30-day PD such a row follows the Section 10 convention (an identity row).
 
 # %%
-N_BOOTSTRAP = 500
-BOOTSTRAP_SEED = 20240315
-CI_PERCENTILES = (2.5, 97.5)
-HORIZON_DAYS = 30
-
-
 def wallet_count_matrix(subset: pd.DataFrame) -> np.ndarray:
     """Return per-wallet transition counts with shape (n_wallets, n_states**2)."""
     wallet_codes, _ = pd.factorize(subset["user_id"])
@@ -1499,8 +1725,8 @@ def wallet_bootstrap_s7_ci(
 
     point_daily = set_absorbing_rows(row_normalize(point_counts, empty_value=np.nan))
     boot_daily = set_absorbing_rows(row_normalize(boot_counts, empty_value=np.nan))
-    point_horizon = np.linalg.matrix_power(fill_empty_rows(point_daily), horizon_days)
-    boot_horizon = np.linalg.matrix_power(fill_empty_rows(boot_daily), horizon_days)
+    point_horizon = project_horizon(fill_empty_rows(point_daily), horizon_days)
+    boot_horizon = project_horizon(fill_empty_rows(boot_daily), horizon_days)
 
     boot_pd_daily = boot_daily[:, :, S7_STATE_IDX]
     boot_pd_horizon = boot_horizon[:, :, S7_STATE_IDX]
@@ -1541,7 +1767,7 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
             point_pd = ci_table["pd_daily_point"].to_numpy()
             observed_rows = ~np.isnan(point_pd)
             if not np.allclose(point_pd[observed_rows], reference_pd[observed_rows]):
-                raise AssertionError(f"Bootstrap point estimates do not match Section 16 for {scenario_label} | {profile}.")
+                raise AssertionError(f"Bootstrap point estimates do not match Section 10 for {scenario_label} | {profile}.")
 
         print(
             f"\n{scenario_label} | {PROFILE_TITLES[profile]}  "
@@ -1551,7 +1777,11 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
         display(ci_table.round(6))
 
 # %% [markdown]
-# ### 17.3 Time-homogeneity check
+# # Part E. Robustness
+#
+# Three checks on the estimates of Part D. They reuse `STATE_ORDER`, `SCENARIO_KEYS`, `PROFILE_KEYS`, `PROFILE_TITLES`, `build_empirical_transition_matrices` and `subset_transitions` from Section 10, `horizon_pd` from Section 11, `run_chain` from Section 8 and `HF_STATE_BINS` / `HF_STATE_LABELS` from Section 1: time homogeneity of $\mathbf{P}$ (Section 12), sensitivity to the Health Factor cut points (Section 13) and sensitivity to the minimum debt (Section 14).
+#
+# ## 12. Time-homogeneity check
 #
 # The $\mathbf{P}^{30}$ projection assumes the daily matrix is constant within the 30-day horizon. Transitions are split by the date of day $t$ (the origin of the transition): days 1-15 of the calibration window versus days 16-30. $\mathbf{P}$ is estimated on each half and shown side by side, together with the difference (days 16-30 minus days 1-15).
 #
@@ -1564,15 +1794,14 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
 # `S1` and `S7` are excluded from the test: they are absorbing by definition and their rows are the identity in both halves. A transient row observed in only one half is not testable and its row difference is left empty. Within-wallet dependence makes the chi-square reference approximate (p-values tend to be too small on large samples), so the test is read together with the size of the differences (`max_abs_row_diff`).
 
 # %%
-HALF_WINDOW_DAYS = 15
-HOMOGENEITY_ALPHA = 0.05
-FIRST_HALF, SECOND_HALF = "days_01_15", "days_16_30"
-scenario_window_start = dict(DAY1_DATE)
+def chi2_sf(statistic: float, dof: int) -> float:
+    """Chi-square survival function (``scipy.special`` only: ``scipy.stats`` is blocked on some Windows setups)."""
+    return float(gammaincc(dof / 2.0, statistic / 2.0))
 
 
 def label_window_half(transitions: pd.DataFrame) -> pd.Series:
     """Label each transition by the half of the calibration window that contains day t."""
-    split_date = transitions["scenario"].map(scenario_window_start) + pd.to_timedelta(HALF_WINDOW_DAYS, unit="D")
+    split_date = transitions["scenario"].map(DAY1_DATE) + pd.to_timedelta(HALF_WINDOW_DAYS, unit="D")
     is_first_half = transitions["date"].lt(split_date)
     return pd.Series(
         np.where(is_first_half, FIRST_HALF, SECOND_HALF),
@@ -1689,23 +1918,19 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
         display(test_table.round(6))
 
 # %% [markdown]
-# ### 17.4 Threshold sensitivity analysis
+# ## 13. Threshold sensitivity analysis
 #
-# `compute_transition_matrix(panel, bins, labels)` rebuilds the chain from the observed pure-wallet Health Factor panel (Section 12) for any set of cut points:
+# `compute_transition_matrix(panel, bins, labels)` rebuilds the chain from the observed pure-wallet Health Factor panel (Section 6) for any set of cut points:
 #
 # 1. Map HF to states with left-closed bins `[a, b)` and force `S7` for `HF <= 1.0`. The liquidation threshold is a protocol rule, not a modelling choice, so it is never shifted.
-# 2. Re-apply the rules of Section 14 end to end through `run_chain`: day-level `S7` (HF or `liquidationCall`), observed `S1`, first absorption, censoring and no transitions across gaps.
+# 2. Re-apply the rules of Section 8 end to end through `run_chain`: day-level `S7` (HF or `liquidationCall`), observed `S1`, first absorption, censoring and no transitions across gaps.
 # 3. Return $\mathbf{P}$ for each regime and profile.
 #
 # The cut points that bound the intermediate states `S4`, `S5`, `S6` (1.10, 1.25, 1.50) are shifted by $-0.05$ and $+0.05$; the liquidation boundary 1.0 and the `S3`/`S2` boundary 2.0 stay fixed. Because a shifted label covers a different HF band, the summary also reports the 30-day PD of the **performing portfolio**: the distribution of each wallet's first observed state over `S2` to `S6`, multiplied by $[\mathbf{P}^{30}]_{\cdot,S7}$. Figures that move little across the three runs indicate that the PD is not an artefact of the chosen boundaries.
 #
-# A sanity check first confirms that the base cut points reproduce the Section 16 matrices.
+# A sanity check first confirms that the base cut points reproduce the Section 10 matrices.
 
 # %%
-SENSITIVITY_SHIFT = 0.05
-INTERMEDIATE_BOUNDARIES = (1.10, 1.25, 1.50)
-
-
 def map_hf_to_states(health_factor: pd.Series, bins: list[float], labels: list[str]) -> pd.Series:
     """Discretize HF with left-closed bins [a, b); HF <= 1.0 is always S7."""
     edges = np.asarray(bins, dtype=float)
@@ -1728,7 +1953,7 @@ def map_hf_to_states(health_factor: pd.Series, bins: list[float], labels: list[s
 def compute_transition_matrix(
     panel: pd.DataFrame, bins: list[float], labels: list[str]
 ) -> dict[tuple[str, str], pd.DataFrame]:
-    """Recompute the empirical P for custom Health Factor boundaries (Section 14 rules, calibration window).
+    """Recompute the empirical P for custom Health Factor boundaries (Section 8 rules, calibration window).
 
     Returns one row-stochastic matrix per (scenario_label, profile).
     """
@@ -1748,12 +1973,6 @@ def shift_intermediate_boundaries(
 ) -> list[float]:
     """Shift only the selected cut points; every other edge is left unchanged."""
     return [edge + shift if any(np.isclose(edge, target) for target in boundaries) else edge for edge in bins]
-
-
-def horizon_pd(transition_p: pd.DataFrame, horizon_days: int = HORIZON_DAYS) -> pd.Series:
-    """Cumulative probability of reaching S7 within horizon_days, by origin state."""
-    power = np.linalg.matrix_power(transition_p.to_numpy(), horizon_days)
-    return pd.Series(power[:, S7_STATE_IDX], index=transition_p.index)
 
 
 def performing_portfolio_pd(
@@ -1794,11 +2013,11 @@ sensitivity_P = {
     for run_name, edges in sensitivity_bins.items()
 }
 
-print("\nSanity check: base bins versus Section 16 matrices")
+print("\nSanity check: base bins versus Section 10 matrices")
 for key, matrix in sensitivity_P["base"].items():
     max_gap = float((matrix - empirical_P[key]).abs().to_numpy().max())
-    print(f"  {key[0]} | Profile {key[1]}: max |P_recomputed - P_section16| = {max_gap:.2e}")
-    assert max_gap < 1e-12, "Base-bin chain does not reproduce Section 16."
+    print(f"  {key[0]} | Profile {key[1]}: max |P_recomputed - P_section10| = {max_gap:.2e}")
+    assert max_gap < 1e-12, "Base-bin chain does not reproduce Section 10."
 
 portfolio_records = []
 for scenario_key, scenario_label in SCENARIO_KEYS:
@@ -1834,13 +2053,11 @@ print(f"\nPerforming-portfolio {HORIZON_DAYS}-day PD by boundary run")
 display(portfolio_sensitivity.round(6))
 
 # %% [markdown]
-# ### 17.5 Minimum-debt sensitivity
+# ## 14. Minimum-debt sensitivity
 #
 # The base panel keeps user-days with at least USD 100 of debt (`MIN_DEBT_USD`). This check re-runs the **same functions** (`qualifying_panel`, `drop_hybrid_wallets`, `run_chain`) with a USD 1,000 minimum, so purity, `S1` detection and censoring are recomputed under the stricter filter, and compares the transition counts $N$ and the 30-day PD by origin state. It is a compact comparison, not a second full pipeline. A higher minimum removes the small positions that liquidators ignore; if the PD of the larger positions differs markedly from the base, the choice of minimum debt matters for the thesis.
 
 # %%
-MIN_DEBT_SENSITIVITY_USD = 1000.0
-
 panel_sensitivity, _ = drop_hybrid_wallets(qualifying_panel(user_day, MIN_DEBT_SENSITIVITY_USD))
 panel_sensitivity = panel_sensitivity.loc[panel_sensitivity["day"] <= T_IDX].reset_index(drop=True)
 panel_sensitivity["state_hf"] = map_health_factor_to_state(panel_sensitivity["health_factor"])
@@ -1873,28 +2090,24 @@ print("Total N by segment:")
 display(min_debt_sensitivity.groupby(["scenario", "profile"])[[f"N_min{MIN_DEBT_USD:.0f}", f"N_min{MIN_DEBT_SENSITIVITY_USD:.0f}"]].sum())
 
 # %% [markdown]
-# ## 18. Export of segment parameters and wallet cohorts (not for production)
+# # Part F. Export and summary
+#
+# ## 15. Export of segment parameters and wallet cohorts (not for production)
 #
 # One export step writes two files to `data/02_interim/` (to `data/sample/02_interim/` in a sample run). The previous `notebook_export_*` files are left untouched.
 #
-# **1. `markov_segment_params_not_for_prod.csv`.** One row per `(scenario, profile, current_state)`: the transition counts `n_S1..n_S7` (Section 17.1), the full row of $\mathbf{P}^{30}$ (`p30_S1..p30_S7`, from the Section 16 matrices), the 30-day PD `pd30_point` with its wallet-bootstrap interval `pd30_ci_low` / `pd30_ci_high` (Section 17.2), `min_debt_usd`, `row_depth` (the number of transitions behind the row) and `row_empty`. Rows of `S1` and `S7` are identity by definition. A transient state without observed transitions has no estimate: `row_empty` is `True` and its `p30_*` and `pd30_*` are left empty (the cell prints a warning that lists them).
+# **1. `markov_segment_params_not_for_prod.csv`.** One row per `(scenario, profile, current_state)`: the transition counts `n_S1..n_S7` (Section 10.2), the full row of $\mathbf{P}^{30}$ (`p30_S1..p30_S7`, from the Section 10 matrices), the 30-day PD `pd30_point` with its wallet-bootstrap interval `pd30_ci_low` / `pd30_ci_high` (Section 11.2), `min_debt_usd`, `row_depth` (the number of transitions behind the row) and `row_empty`. Rows of `S1` and `S7` are identity by definition. A transient state without observed transitions has no estimate: `row_empty` is `True` and its `p30_*` and `pd30_*` are left empty (the cell prints a warning that lists them).
 #
 # **2. `markov_wallet_cohorts_not_for_prod.csv`.** One row per wallet and cohort (`cohort`):
 #
 # - `day1`: the wallets observed on $t-30$ (no late entrants), with the state, Health Factor, EAD (`total_debt_usd`) and collateral of that day, and the calibration outcome at $t$: `final_state`, `event_date`, `exit_reason`. This is the cohort of the in-sample backtest.
-# - `valuation`: the wallets observed on $t$, with their state **as observed that day** (no forward fill). `is_late_entrant` marks wallets whose spell did not start on $t-30$ (they entered later, or re-entered after a repayment). For the out-of-time backtest each row also carries `oot_outcome` (`S7`, `S1`, `transient` or `censored`) and `oot_event_date`, from the days $(t, t+30]$ with the rules of Section 14: the first absorption wins; a wallet still in the filter on $t+30$ is `transient`; one that left the filter and never came back is `censored`; a wallet already in `S7` on $t$ keeps `S7` with `oot_event_date = t`.
+# - `valuation`: the wallets observed on $t$, with their state **as observed that day** (no forward fill). `is_late_entrant` marks wallets whose spell did not start on $t-30$ (they entered later, or re-entered after a repayment). For the out-of-time backtest each row also carries `oot_outcome` (`S7`, `S1`, `transient` or `censored`) and `oot_event_date`, from the days $(t, t+30]$ with the rules of Section 8: the first absorption wins; a wallet still in the filter on $t+30$ is `transient`; one that left the filter and never came back is `censored`; a wallet already in `S7` on $t$ keeps `S7` with `oot_event_date = t`.
 #
 # Collateral is split by asset group (`eth_core_usd` includes the ETH liquid staking tokens, `wbtc_usd`, `uni_usd`, `link_usd`, `stable_usd`) and summarised by the collateral-weighted `lt_w` and `lb_w`. For every `S7` entry linked to a row, `s7_trigger` gives its trigger (`hf` or `liquidation_call`), `hf_at_s7_entry` the Health Factor of the entry day, and `days_s7_to_liquidation` the days from the first snapshot with $HF \le 1$ to the first `liquidationCall`. If the entry was triggered by a `liquidationCall` and the snapshot $HF$ of that day is above 1 (the liquidation already restored it), `hf_at_s7_entry` takes the $HF$ of the previous day's snapshot and `hf_at_s7_entry_prev_day` is `True`. A `liquidationCall` entry has no snapshot with $HF \le 1$ (crossing and liquidation fall in the same daily interval), so its `days_s7_to_liquidation` is 0; for an `hf` entry it is `NaN` when no liquidation follows within the window. **Use of the trigger downstream:** the previous-day $HF$ of a `liquidation_call` entry is above 1 by construction, so the LGD module should treat those entries with $HF_{entry} = 1$ (the Health Factor at the moment of the liquidation) and keep the observed $HF$ for `hf` entries.
 #
 # Before writing, the cell checks the tables; after writing, both files are read back to confirm an exact round trip, and $\mathbf{N}$, $\mathbf{P}^{30}$, the intervals and the `exit_reason` counts are recomputed from the files and compared with the values in memory.
 
 # %%
-SEGMENT_EXPORT_PATH = INTERIM_DATA_DIR / "markov_segment_params_not_for_prod.csv"
-COHORT_EXPORT_PATH = INTERIM_DATA_DIR / "markov_wallet_cohorts_not_for_prod.csv"
-STOCHASTIC_TOLERANCE = 1e-9
-ROUND_TRIP_TOLERANCE = 1e-12
-DATE_FORMAT = "%Y-%m-%d"
-
 SEGMENT_COLUMNS = (
     ["scenario", "profile", "current_state"]
     + [f"n_{state}" for state in STATE_ORDER]
@@ -1909,47 +2122,13 @@ COHORT_COLUMNS = [
 ]  # fmt: skip
 
 
-def compute_horizon_matrix(transition_p: pd.DataFrame, horizon_days: int = HORIZON_DAYS) -> pd.DataFrame:
-    """Return the full horizon_days-step transition matrix P^horizon_days."""
-    if horizon_days < 1:
-        raise ValueError(f"horizon_days must be a positive integer, got {horizon_days}.")
-    if list(transition_p.index) != STATE_ORDER or list(transition_p.columns) != STATE_ORDER:
-        raise ValueError("Daily transition matrix rows and columns must follow STATE_ORDER.")
-    daily = transition_p.to_numpy(dtype=float)
-    if not np.isfinite(daily).all():
-        raise ValueError("Daily transition matrix contains non-finite values.")
-    return pd.DataFrame(
-        np.linalg.matrix_power(daily, horizon_days),
-        index=pd.Index(STATE_ORDER, name="current_state"),
-        columns=STATE_ORDER,
-    )
-
-
-def validate_horizon_matrix(
-    horizon_p: pd.DataFrame, daily_p: pd.DataFrame, segment: str, horizon_days: int = HORIZON_DAYS, tolerance: float = STOCHASTIC_TOLERANCE
-) -> None:
-    """Raise if P^horizon_days is not a valid stochastic matrix consistent with Section 17.4."""
-    values = horizon_p.to_numpy(dtype=float)
-    if not np.isfinite(values).all():
-        raise ValueError(f"{segment}: P^{horizon_days} contains non-finite values.")
-    if (values < -tolerance).any():
-        raise ValueError(f"{segment}: P^{horizon_days} contains negative probabilities.")
-    if not np.allclose(values.sum(axis=1), 1.0, atol=tolerance):
-        raise ValueError(f"{segment}: P^{horizon_days} rows do not sum to 1.")
-    reference_pd = horizon_pd(daily_p, horizon_days).to_numpy(dtype=float)
-    if not np.allclose(values[:, S7_STATE_IDX], reference_pd, atol=tolerance):
-        raise AssertionError(f"{segment}: S7 column does not match horizon_pd from Section 17.4.")
-
-
 def build_segment_params_table() -> pd.DataFrame:
     """Stack N, P^30 and the bootstrap interval of every regime, profile and origin state."""
     rows = []
     for scenario_key, scenario_label in SCENARIO_KEYS:
         for profile in PROFILE_KEYS:
-            counts_n = absolute_N[(scenario_label, profile)]
-            daily_p = empirical_P[(scenario_label, profile)]
-            horizon_p = compute_horizon_matrix(daily_p)
-            validate_horizon_matrix(horizon_p, daily_p, f"{scenario_label} | {profile}")
+            counts_n = empirical_N[(scenario_label, profile)]
+            horizon_p = empirical_P30[(scenario_label, profile)]
             ci_table = bootstrap_s7_ci[(scenario_label, profile)]
             for state in STATE_ORDER:
                 row_depth = int(counts_n.loc[state].sum())
@@ -2145,11 +2324,11 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
             (segment_reloaded["scenario"] == scenario_label) & (segment_reloaded["profile"] == profile)
         ].set_index("current_state").loc[STATE_ORDER]
         counts_file = block[[f"n_{state}" for state in STATE_ORDER]].to_numpy(dtype=float)
-        assert np.array_equal(counts_file, absolute_N[(scenario_label, profile)].to_numpy(dtype=float)), "N differs after reload."
+        assert np.array_equal(counts_file, empirical_N[(scenario_label, profile)].to_numpy(dtype=float)), "N differs after reload."
 
         p_file = fill_empty_rows(set_absorbing_rows(row_normalize(counts_file, np.nan)))
         assert np.allclose(p_file, empirical_P[(scenario_label, profile)].to_numpy(), atol=ROUND_TRIP_TOLERANCE, rtol=0)
-        p30_file = np.linalg.matrix_power(p_file, HORIZON_DAYS)
+        p30_file = project_horizon(p_file, HORIZON_DAYS)
         p30_exported = block[[f"p30_{state}" for state in STATE_ORDER]].to_numpy(dtype=float)
         observed = ~np.isnan(p30_exported).any(axis=1)
         assert observed[[STATE_INDEX[s] for s in ABSORBING_STATES]].all()
@@ -2198,3 +2377,16 @@ display(
         n_without_liquidation=("days_s7_to_liquidation", lambda s: int(s.isna().sum())),
     )
 )
+
+# %% [markdown]
+# ## 16. Results summary
+#
+# What the notebook delivers, section by section (no new numbers: the figures are in the tables above and in the exports).
+#
+# - **Panel and trajectories (Parts B-C).** The pure A and B wallets of each scenario, their daily states and the exit reason of every spell (`S1_repay`, `S7_hf`, `S7_liquidation_call`, `censored_filter_exit`, `censored_window_end`). Sections 9 and 9.1 report the sample sizes, the informative-censoring check and the `S7` outcomes that $\mathbf{N}$ does not see.
+# - **Matrices (Section 10).** Four daily matrices $\mathbf{P}$ (baseline and stress, profiles A and B) with their count matrices $\mathbf{N}$. The `S1` and `S7` rows are the identity by definition; an origin state with fewer than `MIN_ROW_DEPTH` transitions is flagged as thin, and one without transitions has no estimate.
+# - **PD (Section 11).** $\text{PD}_i = [\mathbf{P}^{30}]_{i,S7}$ by origin state with the 95% wallet-bootstrap interval. Read the thin rows together with their interval.
+# - **Robustness (Part E).** The time-homogeneity test (Section 12) is provisional and will be replaced. Section 13 shows how the PD moves when the intermediate cut points are shifted by $\pm 0.05$ and Section 14 when the minimum debt rises to USD 1,000: they tell whether those choices matter for the thesis.
+# - **Exports (Section 15).** `markov_segment_params_not_for_prod.csv` and `markov_wallet_cohorts_not_for_prod.csv`, checked by an exact round trip. A sample run writes under `data/sample/02_interim/` and its figures are not estimates (the sample is stratified, not representative).
+#
+# Open points: the out-of-time backtest uses the `oot_*` columns of the cohort export; the `S7` outcomes without an entry transition (Section 9.1) should be reported apart in the in-sample backtest.
