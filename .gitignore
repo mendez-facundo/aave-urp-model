@@ -36,3 +36,8 @@ Thumbs.db
 data/sample/*
 !data/sample/.gitkeep
 !data/sample/README.md
+
+# Local context for AI agents and private notes (kept on disk, never pushed)
+CLAUDE.md
+docs/internal/
+.claude/

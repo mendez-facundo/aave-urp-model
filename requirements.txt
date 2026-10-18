@@ -152,3 +152,4 @@ websockets==17.1
 widgetsnbextension==4.0.16
 wrapt==2.4.1
 yarl==1.24.5
+jupytext==1.19.6
