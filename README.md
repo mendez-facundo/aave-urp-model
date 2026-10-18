@@ -1,85 +1,159 @@
 # User Risk Premium Model
 
-**Stochastic calibration of the User Risk Premium and Liquidity Hub provisioning for Aave v4, using discrete-time Markov chains and extreme value theory.**
+**Stochastic Expected Credit Loss engine to calibrate the Aave v4 User Risk Premium, built on discrete-time Markov chains (PD) and extreme value theory (LGD).**
 
-## Abstract / Architecture
+Actuarial thesis, Universidad de Buenos Aires (UBA).
 
-Aave v4 transitions toward a Hub & Spoke architecture where a User Risk Premium (URP) prices individual borrower risk to fund the Liquidity Hub's insolvency reserves. While this mechanism is designed to absorb bad debt, the underlying risk parameters currently depend on static, high-latency DAO governance votes. This rigidity reproduces structural flaws: it penalizes safe collateral during stability and undercapitalizes the protocol during severe market stress, forcing reliance on the Safety Module and risking procyclical death spirals.
+## Overview
 
-This repository presents a stochastic Expected Credit Loss (ECL) engine designed to autonomously calibrate the URP. By decoupling Probability of Default (PD) via discrete-time Markov chains and Loss Given Default (LGD) via Extreme Value Theory, this framework transforms the URP from a static heuristic into a continuous, risk-based actuarial provision.
+Aave v4 moves to a Hub & Spoke architecture in which a **User Risk Premium (URP)** prices each borrower's risk and funds the Liquidity Hub's reserves against bad debt. Today the risk parameters behind that pricing come from static, high-latency DAO governance votes: they penalise safe collateral in calm markets and undercapitalise the protocol under stress.
 
-This repository implements a two-pillar quantitative architecture that replaces static premia with scenario-contingent risk measures:
-
-1. **Discrete-Time Markov Chains (DTMC).** Health-factor and repayment paths are mapped onto a finite state space. Competing risks are isolated so that **default probabilities** are not confounded with **voluntary (competitive) prepayment**. The resulting transition matrix yields IFRS 9 stage-consistent PDs for the Liquidity Hub book.
-2. **Extreme Value Theory (EVT).** Collateral returns are modelled with a **Peaks-Over-Threshold (POT)** approach and a **Generalized Pareto Distribution (GPD)**. The fitted tail supplies a **downturn LGD**—a stressed severity consistent with IFRS 9 lifetime-loss and downturn-collateral guidance.
-
-Empirical identification currently uses **Aave v3 on Ethereum** as the observable analogue of the v4 Hub. Two cross-sections pin the design:
-
-
-| Scenario     | Valuation date | Archive block | Role                                        |
-| ------------ | -------------- | ------------- | ------------------------------------------- |
-| **Baseline** | 15 March 2024  | `19,433,100`  | Benign collateral and funding regime        |
-| **Stress**   | 5 August 2024  | `20,457,180`  | Stressed collateral regime for downturn LGD |
-
-
-Market tails (BTC, ETH, UNI) are extracted from Binance daily candles. Protocol exposures are reconstructed from archive `eth_call` snapshots of `AaveProtocolDataProvider.getUserReserveData`. Downstream notebooks calibrate the Markov and GPD layers and translate PD × EAD × downturn LGD into a **dynamic URP** and Hub ECL.
-
-**Current status.** The **data-extraction pipeline** is operational. Processing modules (`src/processing/`) and result notebooks for Markov, EVT, and ECL are scaffolded and will be populated as calibration proceeds.
-
-## Directory Structure
+This repository implements an Expected Credit Loss (ECL) engine that replaces the static heuristic with a continuous, risk-based actuarial provision:
 
 ```text
-aave-urp-model/
-├── data/
+ECL = EAD x PD x LGD   ->   User Risk Premium
+```
+
+| Component | Estimated with | Question it answers |
+| --------- | -------------- | ------------------- |
+| **EAD** | Debt of each wallet, valued at the Aave oracle price | How much is exposed? |
+| **PD** | Discrete-time Markov chain over daily Health Factor states | How likely is a liquidation event within 30 days? |
+| **LGD** | Extreme value theory on collateral log-losses (POT/GPD, Expected Shortfall) | How much is lost if the liquidation happens? |
+
+Aave v3 on Ethereum is used as the observable analogue of the v4 Hub. IFRS 9 is a conceptual inspiration for the expected-loss framing only: the project implements neither stages nor SICR. Expected results are stated as testable hypotheses, not as conclusions.
+
+## Methodology
+
+### Probability of default: Markov chain on Health Factor states
+
+Each wallet-day is mapped to one of seven states.
+
+| State | Definition | Type |
+| ----- | ---------- | ---- |
+| **S1** | Repayment observed on-chain that closes the position (residual debt at or below the dust threshold) | Absorbing |
+| **S2** | HF > 2.0 | Transient |
+| **S3** | 1.5 < HF <= 2.0 | Transient |
+| **S4** | 1.25 < HF <= 1.5 | Transient |
+| **S5** | 1.10 <= HF <= 1.25 | Transient |
+| **S6** | 1.0 < HF < 1.10 | Transient |
+| **S7** | Liquidation event (technical default): HF <= 1 in the daily snapshot, or an on-chain `liquidationCall` on the wallet | Absorbing |
+
+- S1 and S7 are absorbing by definition. **Right-censoring** applies only to wallets whose outcome is not observed: the window ends, or the wallet leaves the profile filter while it still has debt.
+- Transitions are never counted across unobserved days (no forward-fill).
+- The 30-day PD of each state is the S7 column of **P^30**.
+- Uncertainty and robustness: absolute count matrices, wallet-level bootstrap confidence intervals, a time-homogeneity check, and sensitivity to the HF cut-offs and to the minimum-debt filter.
+- The choice of the calibration window is under study (out-of-sample selection).
+
+### Loss given default: EVT on collateral returns
+
+- Daily log-losses of each collateral asset are modelled with **Peaks-Over-Threshold**: a Generalized Pareto Distribution fitted on a 730-day window, with threshold diagnostics, Q-Q plots and a bootstrap confidence interval.
+- The **Expected Shortfall** (99%) is converted into a price shock as `E[1 - exp(-X) | X > VaR]`, the tail-averaged price decline, consistent with log-losses (Jensen).
+- The LGD is **conditional on the liquidation event** and uses the real liquidation threshold (LT) and liquidation bonus (LB) of each reserve:
+
+  ```text
+  LGD_w = max(0, 1 - (HF_entry / LT_w) * sum_k s_k (1 - shock_k) / (1 + LB_w))
+  ```
+
+  where `s_k` is the share of collateral asset `k` in wallet `w`.
+- Per-asset shocks are **comonotonic** (all collateral falls at once, each with its own ES). LST shocks equal the ETH shock.
+- Notebook 04 also holds an exploratory menu of LGD variants (confidence level, multi-day horizon, stablecoin de-peg).
+
+### Validation
+
+1. In-sample backtest on the day-1 cohort: expected liquidations (sum of `n_i * PD_i`) against observed entries to S7.
+2. Out-of-time backtest: the portfolio at `t` against liquidations observed in `(t, t+30]`.
+3. Blind application on the full set of indebted wallets at block `t` from an archive RPC (Alchemy), classified by profile with the on-chain data.
+
+Methodological decisions and their rationale are logged in [`docs/decisions.md`](docs/decisions.md).
+
+## Scenarios and profiles
+
+Each scenario is a valuation date `t`. Daily data use the first block at or after 00:00 UTC of each date.
+
+| Scenario | Folder | Valuation date `t` | Block at `t` | Role |
+| -------- | ------ | ------------------ | ------------ | ---- |
+| **Baseline** | `baseline_mar2024` | 2024-03-15 | `19,436,645` | Benign collateral and funding regime |
+| **Stress** | `stress_aug2024` | 2024-08-05 | `20,458,638` | Stressed collateral regime for the downturn LGD |
+
+Wallets are segmented into two profiles, both with **stablecoin debt only**:
+
+| Profile | Collateral composition |
+| ------- | ---------------------- |
+| **A** | At least 85% ETH or liquid staking tokens (LSTs) |
+| **B** | At least 85% UNI + LINK |
+
+## Data pipeline
+
+All extractors live in `src/extraction/` and write under `data/01_raw/<scenario>/`. Each scenario window runs from `t-60` to `t+30` days, one snapshot per UTC day.
+
+| Source | Extractor | Output |
+| ------ | --------- | ------ |
+| **The Graph**, Aave v3 Ethereum subgraph, queried with block time-travel (`block: {number: B}`) | `aave_graph_agent.py` | `thegraph_daily/` (positions per day), `thegraph_events/` (`liquidationCall` and `repay` events), `protocol/` (reserve parameters incl. LT, LB, LTV and eMode, plus `daily_blocks.csv`) |
+| **Aave oracle** on chain, `AaveOracle.getAssetsPrices` at each daily block through JSON-RPC | `aave_oracle_agent.py` | `prices/aave_oracle_daily.csv` (stablecoins and LSTs at their oracle price) |
+| **Binance** daily klines, 730 days | `binance_agent.py` | `prices/binance_daily.csv` (input of the EVT notebook) |
+
+Balances are rebuilt from the scaled balances and the liquidity and borrow indices at each block, because the subgraph's `current*` fields are frozen at each user's last own event. Positions are valued at the Aave oracle price, which is the price the protocol itself uses to liquidate. Binance prices are used only for EVT.
+
+`aave_rpc_agent.py` and `extract_active_wallets.py` are the earlier Alchemy snapshot tools. They are kept for reference and will be rewritten (Multicall3) for the blind application.
+
+## Repository structure
+
+Folders marked `(git-ignored)` are materialised locally and not versioned.
+
+```text
+.
+├── data/                                  (git-ignored contents)
 │   ├── 01_raw/
-│   │   ├── baseline_mar2024/      # OHLCV CSVs, wallet universe, RPC snapshot
-│   │   └── stress_aug2024/
-│   ├── 02_interim/
-│   └── 03_processed/
+│   │   ├── baseline_mar2024/
+│   │   │   ├── thegraph_daily/            # positions_<date>.csv.gz + metadata.json
+│   │   │   ├── thegraph_events/           # liquidation_calls.csv, repays.csv
+│   │   │   ├── protocol/                  # reserve_params_daily, emode_categories_daily, daily_blocks
+│   │   │   └── prices/                    # aave_oracle_daily.csv, binance_daily.csv
+│   │   └── stress_aug2024/                # same layout
+│   ├── 02_interim/                        # notebook exports (*_not_for_prod.csv)
+│   ├── 03_processed/                      # reserved for the production pipeline
+│   └── sample/                            # small stratified dev sample (see data/sample/README.md)
+├── docs/
+│   ├── decisions.md                       # methodological decision log (Spanish)
+│   └── findings_graph_extraction.md       # diagnosis of the original extraction error (Spanish)
 ├── notebooks/
-│   ├── 01_eda_market_data.ipynb
-│   ├── 01b_eda_aave_snapshots.ipynb
-│   ├── 02_markov_calibration.ipynb
-│   ├── 03_evt_gpd_fitting.ipynb
-│   └── 04_ecl_urp_results.ipynb
+│   ├── 01_eda_market_data.ipynb           # EDA of Binance prices
+│   ├── 02_markov_calibration.ipynb        # Markov calibration (PD)
+│   ├── 03_evt_gpd_fitting.ipynb           # EVT / GPD (LGD inputs)
+│   ├── 04_ecl_urp_results.ipynb           # integrated ECL table, backtest, LGD variants
+│   └── py/                                # jupytext py:percent pairs of the notebooks
+├── scripts/
+│   ├── check_raw_data.py                  # structural checks of the raw data
+│   ├── make_dev_sample.py                 # builds data/sample/
+│   └── raw_data_common.py                 # helpers shared by the two scripts above
 ├── src/
-│   ├── extraction/
-│   │   ├── binance_agent.py           # Daily BTC/ETH/UNI/LINK klines
-│   │   ├── extract_active_wallets.py  # Wallet universe (The Graph)
-│   │   ├── aave_rpc_agent.py          # Archive RPC collateral/debt snapshot
-│   │   └── aave_graph_agent.py        # 30-day GraphQL position/liquidation history
-│   ├── processing/
-│   │   ├── markov_model.py
-│   │   ├── evt_model.py
-│   │   └── ecl_calculator.py
+│   ├── extraction/                        # data agents (see Data pipeline)
+│   ├── processing/                        # empty placeholders, by design (see Status)
 │   └── utils/
-│       ├── config.py
+│       ├── blocks.py                      # UTC date -> Ethereum block
+│       ├── rpc.py                         # requests-based JSON-RPC client (web3 not required)
+│       ├── protocol_params.py             # single source of reserve parameters (LT, LB, LTV, eMode)
+│       ├── stats_compat.py                # fallback when scipy.stats cannot be imported
 │       └── logger.py
+├── tests/                                 # plain-assert tests, run directly with Python
+├── .env.example
 ├── requirements.txt
 └── README.md
 ```
 
-Raw extracts are git-ignored (`data/01_raw/*`). Re-run the agents below to materialise local copies.
-
-## Setup & Installation
-
-
+## Reproducing the results
 
 ### Prerequisites
 
-- **Python 3.11+** (the reference environment uses 3.14)
-- An **archive-capable Ethereum RPC** (Alchemy or equivalent). Historical `eth_call` at blocks `19,433,100` and `20,457,180` will fail on a non-archive node.
-- A **The Graph** API key, required to build the wallet universe before the RPC snapshot.
+- **Python 3.11+**.
+- A **The Graph** API key (`GRAPH_API_KEY`).
+- An **archive-capable Ethereum JSON-RPC endpoint**, for example Alchemy (`ALCHEMY_RPC_URL`). Historical `eth_call` fails on a non-archive node.
 
-
-
-### 1. Clone and create a virtual environment
+### 1. Environment
 
 **Windows (PowerShell)**
 
 ```powershell
-git clone <repository-url> aave-urp-model
-cd aave-urp-model
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 ```
@@ -87,107 +161,90 @@ python -m venv venv
 **macOS / Linux**
 
 ```bash
-git clone <repository-url> aave-urp-model
-cd aave-urp-model
 python3 -m venv venv
 source venv/bin/activate
 ```
-
-
-
-### 2. Install dependencies
 
 ```bash
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+### 2. Secrets
 
-
-### 3. Configure environment variables
-
-Create a `.env` file in the project root (do not commit it). The extraction agents load it via `python-dotenv`.
+Copy `.env.example` to `.env` (never commit it) and fill in both values. The agents load it through `python-dotenv`.
 
 ```env
-# Archive Ethereum JSON-RPC (Alchemy recommended)
-ALCHEMY_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/<YOUR_API_KEY>
-
-# The Graph decentralized network gateway
-GRAPH_API_KEY=<YOUR_GRAPH_API_KEY>
+GRAPH_API_KEY=<your The Graph API key>
+ALCHEMY_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/<your API key>
 ```
 
-`ALCHEMY_RPC_URL` is mandatory for `aave_rpc_agent.py`. `GRAPH_API_KEY` is mandatory for `extract_active_wallets.py`.
+### 3. Extract the raw data
 
-## Usage: Data Extraction Pipeline
-
-All commands are executed from the **repository root**. Each agent writes into `data/01_raw/baseline_mar2024/` and `data/01_raw/stress_aug2024/`.
-
-### Step 1 — Market prices (Binance)
-
-Downloads approximately two years of daily OHLCV for `BTCUSDT`, `ETHUSDT`, `UNIUSDT` and `LINKUSDT`, ending on **2024-03-15** (baseline) and **2024-08-05** (stress). No API key is required.
+Run from the repository root. `--scenario` accepts `baseline`, `stress` or `all` (the default). The Graph and oracle agents are resumable: re-running the same command skips the days already on disk.
 
 ```bash
+python src/extraction/aave_graph_agent.py  --scenario baseline
+python src/extraction/aave_oracle_agent.py --scenario baseline
 python src/extraction/binance_agent.py
 ```
 
-**Outputs**
-
-- `data/01_raw/baseline_mar2024/binance_prices_{btc,eth,uni,link}.csv`
-- `data/01_raw/stress_aug2024/binance_prices_{btc,eth,uni,link}.csv`
-
-
-
-### Step 2 — Active wallet universe (The Graph)
-
-Time-travels the Aave v3 Ethereum subgraph to the two archive blocks and writes a unique address list. This file is the input universe for the RPC snapshot.
+### 4. Check the raw data
 
 ```bash
-python src/extraction/extract_active_wallets.py
+python scripts/check_raw_data.py
 ```
 
-**Outputs**
+Verifies that dates and blocks agree across files, that every position has an oracle price and reserve parameters, that the universe changes from day to day, and that events fall inside the window.
 
-- `data/01_raw/baseline_mar2024/all_active_wallets.json`
-- `data/01_raw/stress_aug2024/all_active_wallets.json`
-
-
-
-### Step 3 — Cross-sectional Aave snapshot (archive RPC)
-
-Queries `AaveProtocolDataProvider.getUserReserveData` at the pinned blocks for every wallet × target reserve (WETH, WBTC, UNI, USDC, USDT, DAI, FRAX, wstETH, rETH, cbETH). Empty positions are omitted. Amounts are stored as **uint256 wei strings**.
-
-```bash
-python src/extraction/aave_rpc_agent.py
-```
-
-**Outputs**
-
-- `data/01_raw/baseline_mar2024/alchemy_snapshot.json` — block `19,433,100`
-- `data/01_raw/stress_aug2024/alchemy_snapshot.json` — block `20,457,180`
-
-The job issues on the order of `n_wallets × n_assets` archive calls, with bounded concurrency and exponential backoff on HTTP 429. Runtime depends on Alchemy compute-unit capacity.
-
-### Step 4 — 30-day GraphQL history
-
-Position and liquidation paths for Health Factor reconstruction (Markov inputs):
-
-```bash
-python src/extraction/aave_graph_agent.py
-```
-
-**Outputs:** `thegraph_hf_30d.json` under each scenario directory.
-
-### Exploratory notebooks
-
-After extraction:
-
-1. `notebooks/01_eda_market_data.ipynb` — Binance series integrity
-2. `notebooks/01b_eda_aave_snapshots.ipynb` — RPC cross-sections
-3. `notebooks/02_markov_calibration.ipynb` — GraphQL payloads / DTMC preparation
-
-Launch Jupyter from the activated environment:
+### 5. Run the notebooks in order
 
 ```bash
 jupyter lab
 ```
 
+1. `01_eda_market_data.ipynb`
+2. `02_markov_calibration.ipynb`
+3. `03_evt_gpd_fitting.ipynb`
+4. `04_ecl_urp_results.ipynb`
+
+The notebooks are paired with `notebooks/py/*.py` (jupytext, `py:percent`). Edit the `.py` file and run `jupytext --sync notebooks/py/<file>.py` to update the notebook. Exports go to `data/02_interim/*_not_for_prod.csv`.
+
+### Development on the sample
+
+`python scripts/make_dev_sample.py` builds a small stratified sample in `data/sample/` from the raw data. To run notebook 02 on it, set `MARKOV_RAW_DATA_DIR=../data/sample`. Its exports are written under `data/sample/02_interim/`, so they cannot be confused with a full run.
+
+### Tests
+
+The tests use plain `assert` statements and run directly, without pytest:
+
+```bash
+python tests/test_protocol_params.py
+python tests/test_stats_compat.py
+python tests/test_aave_graph_agent.py
+```
+
+## Status and roadmap
+
+**Done**
+
+- Data pipeline re-extracted with block time-travel, Aave oracle prices and on-chain events (replaces the invalid first panel, see below).
+- Notebook 02: Markov calibration on the daily snapshots, with count matrices, bootstrap intervals and sensitivities.
+- Notebook 03: EVT/GPD fits, ES at several levels and horizons, liquidation break-even shocks.
+- Notebook 04: integrated ECL table per scenario and profile, in-sample backtest, exploratory LGD variants.
+
+**Pending**
+
+- Selection of the calibration window (out-of-sample).
+- Out-of-time backtest on `(t, t+30]`.
+- Choice of the final LGD, possibly a point-in-time GARCH-EVT.
+- Smoothing of profile B, whose sample is sparse.
+- Blind application on Alchemy data (rewrite of the RPC snapshot with Multicall3).
+- Production pipeline in `src/processing/`, built once the methodology is final (the module files are intentionally empty until then).
+- URP calibration.
+
+## Documentation
+
+- [`docs/decisions.md`](docs/decisions.md): methodological decision log with the rationale of each choice, and the open questions (Spanish).
+- [`docs/findings_graph_extraction.md`](docs/findings_graph_extraction.md): diagnosis of the original extraction error. Queries without block time-travel returned 2026 balances instead of the 2024 state, which invalidated the first panel (Spanish).
+- [`data/sample/README.md`](data/sample/README.md): how the development sample is built.
