@@ -20,7 +20,7 @@
 #
 # **Purpose.** Rebuild the empirical **Health Factor (HF)** panel of Aave v3 from the **daily time-travel snapshots** (The Graph, one positions file per UTC day, every position valued with the **Aave oracle** price of the day), apply the actuarial purity filters, and calibrate for each market regime and collateral profile a discrete-time **Markov chain over the states S1-S7**. The chain gives the probability that a wallet that starts in a given HF state reaches a liquidation event within 30 days: the PD of $\text{ECL} = \text{EAD} \times \text{PD} \times \text{LGD}$.
 #
-# **Scenarios and windows.** Both scenarios are processed in parallel: baseline, $t$ = 15 March 2024 (`data/01_raw/baseline_mar2024/`), and stress, $t$ = 5 August 2024 (`data/01_raw/stress_aug2024/`). Every raw input is filtered at load time to $[t-\text{HISTORY\_DAYS},\, t+\text{OOT\_DAYS}]$ = $[t-30, t+30]$ (61 snapshots); the raw folders may hold a longer range, which is ignored. **Calibration uses $[t-30, t]$ only**: the transition counts $\mathbf{N}$ and the matrices $\mathbf{P}$ come from the 30 daily transitions inside that window. The days $(t, t+30]$ are reserved for the out-of-time validation: they never enter $\mathbf{N}$ or $\mathbf{P}$, but the export records what that backtest needs (`oot_outcome`, `oot_event_date`).
+# **Scenarios and windows.** Both scenarios are processed in parallel: baseline, $t$ = 15 March 2024 (`data/01_raw/baseline_mar2024/`), and stress, $t$ = 5 August 2024 (`data/01_raw/stress_aug2024/`). Every raw input is filtered at load time to $[t-\text{HISTORY\_DAYS},\, t+\text{OOT\_DAYS}]$ = $[t-60, t+30]$ (91 snapshots); the raw folders may hold a longer range, which is ignored. **Calibration uses $[t-30, t]$ only** (`CALIBRATION_DAYS = 30`): the transition counts $\mathbf{N}$ and the matrices $\mathbf{P}$ come from the 30 daily transitions inside that window, and every production table (states, trajectories, $\mathbf{N}$, $\mathbf{P}$, $\mathbf{P}^{30}$, bootstrap, cohorts, sensitivities, exports) is built on the panel restricted to $[t-30, t+30]$, so its rules are the ones of a 61-snapshot run. The days $(t, t+30]$ are reserved for the out-of-time validation: they never enter $\mathbf{N}$ or $\mathbf{P}$, but the export records what that backtest needs (`oot_outcome`, `oot_event_date`). The 30 extra days of history $[t-60, t-31)$ are used **only** by Section 12.2, which selects the length of the calibration window out of sample: lengths $W \in \{5, 7, 10, 14, 21, 30\}$ (`WINDOW_GRID`), forecast origins $s \in [t-30, t-1]$ (each may look back up to 30 days), Jeffreys pseudo-count 0.5 and a 500-replicate wallet bootstrap for the standard error.
 #
 # **States and Health Factor cut-offs.**
 #
@@ -49,7 +49,7 @@
 # - `markov_segment_params_not_for_prod.csv`: per scenario, profile and origin state, the counts $n_{S1..S7}$, the full row of $\mathbf{P}^{30}$, the 30-day PD with its wallet-bootstrap interval and the row depth. Consumed by notebook 04 (PD side of the ECL).
 # - `markov_wallet_cohorts_not_for_prod.csv`: one row per wallet and cohort. The `valuation` cohort (wallets observed on $t$: state and EAD) feeds notebook 04; the `day1` cohort feeds its in-sample backtest; `s7_trigger`, `hf_at_s7_entry`, `lt_w` and `lb_w` are for the LGD module, and the `oot_*` columns for the later out-of-time backtest.
 #
-# **Layout.** Part A, inputs (Sections 1-2). Part B, panel (3-6). Part C, states and trajectories (7-9). Part D, estimation of $\mathbf{N}$, $\mathbf{P}$, $\mathbf{P}^{30}$ and the PD (10-11). Part E, robustness (12-14). Part F, export and summary (15-16).
+# **Layout.** Part A, inputs (Sections 1-2). Part B, panel (3-6). Part C, states and trajectories (7-9). Part D, estimation of $\mathbf{N}$, $\mathbf{P}$, $\mathbf{P}^{30}$ and the PD (10-11). Part E, robustness and calibration window (12-14): sub-window comparison and out-of-sample selection of the window length (12), Health Factor cut points (13), minimum debt (14). Part F, export and summary (15-16).
 #
 # **Development.** The raw folder is configurable through `RAW_DATA_DIR` (default `../data/01_raw`; set the environment variable `MARKOV_RAW_DATA_DIR=../data/sample` to develop on the small sample). A run on the sample writes its exports under `data/sample/02_interim/` so that it can never be mistaken for a full run.
 
@@ -60,14 +60,18 @@
 #
 # A single cell holds the imports and **every tunable parameter** of the notebook, grouped by the part that uses them, so that a sensitivity run edits one place. The values that are derived from them (day indices, window dates, state indices) are computed in the same cell.
 #
-# - **Window.** `HISTORY_DAYS` days before $t$ and `OOT_DAYS` days after $t$ are loaded; `CALIBRATION_DAYS` is the length of the calibration window $[t-30, t]$. Days are indexed by `day` (`t-30 = 0`, `t = 30`) and wallets by `wid`; both are combined in the key `key = wid * DAY_STRIDE + day`, which turns "the same wallet on the next day" into `key + 1` and keeps the transition logic of Section 8 vectorised. The index of day 0 is the first loaded day, so the notebook requires `HISTORY_DAYS == CALIBRATION_DAYS`.
-# - **Why the date filter.** The raw folders are being extended to $[t-60, t+30]$. Without a filter the earlier days would get negative `day` indices and collide with other wallets in the key. Every loader of Section 2 therefore keeps only the dates in $[t-\text{HISTORY\_DAYS},\, t+\text{OOT\_DAYS}]$ and asserts it.
+# - **Window.** `HISTORY_DAYS` days before $t$ and `OOT_DAYS` days after $t$ are loaded; `CALIBRATION_DAYS` is the length of the production calibration window $[t-30, t]$. Days are indexed by `day` (`t-60 = 0`, `t-30 = CAL_START_IDX = 30`, `t = T_IDX = 60`, `t+30 = LAST_IDX = 90`) and wallets by `wid`; both are combined in the key `key = wid * DAY_STRIDE + day`, which turns "the same wallet on the next day" into `key + 1` and keeps the transition logic of Section 8 vectorised. The index of day 0 is the first loaded day (`DAY0_DATE`, $t-60$); the first day of the calibration window and of the "day-1" cohort is `CAL_START_DATE` ($t-30$). The notebook requires `HISTORY_DAYS >= CALIBRATION_DAYS`.
+# - **Production versus history.** Everything the exports depend on runs on the panel restricted to $[t-\text{CALIBRATION\_DAYS},\, t+\text{OOT\_DAYS}]$ (`CAL_START_IDX` onwards, Section 5), with the chain functions called with `first_day = CAL_START_IDX`, so their rules (spells, late entrants, exclusion after `S7`, censoring) are those of a notebook that only loads 61 days. Wallet codes are assigned first to the wallets of that window, in order of appearance, so that adding history does not change the codes nor the wallet order of the seeded bootstrap. The earlier days enter only the window-selection experiment of Section 12.2.
+# - **Window selection (Section 12).** `WINDOW_GRID` (candidate lengths $W$), `SELECTION_ORIGINS` (origins $t-30, \dots, t-1$), `JEFFREYS_PSEUDOCOUNT`, `N_BOOTSTRAP_SELECTION` and `SELECTION_SEED` for the out-of-sample selection; `HALF_WINDOW_DAYS`, `N_BOOTSTRAP_SUBWINDOW`, `ROLLING_WINDOW_DAYS` and `ROLLING_STEP_DAYS` for the sub-window comparison. The assertion on the parameter cell checks that the loaded history covers the longest candidate window.
+# - **Why the date filter.** The raw folders may hold more than $[t-60, t+30]$. Without a filter the earlier days would get negative `day` indices and collide with other wallets in the key. Every loader of Section 2 therefore keeps only the dates in $[t-\text{HISTORY\_DAYS},\, t+\text{OOT\_DAYS}]$ and asserts it.
 
 # %%
 import json
 import os
 import sys
+import time
 import warnings
+from functools import reduce
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -117,18 +121,20 @@ VALUATION_DATE = {
     "stress": pd.Timestamp("2024-08-05"),
 }
 
-HISTORY_DAYS = 30  # days before t kept from the raw folders (the folders may hold more: it is ignored)
-CALIBRATION_DAYS = 30  # calibration window [t - 30, t]
+HISTORY_DAYS = 60  # days before t kept from the raw folders (the folders may hold more: it is ignored)
+CALIBRATION_DAYS = 30  # production calibration window [t - 30, t] (stays 30 until the author and the tutor decide, Section 12)
 OOT_DAYS = 30  # out-of-time window (t, t + 30]
-assert HISTORY_DAYS == CALIBRATION_DAYS, "Day 0 is the first loaded day: the calibration window must be the whole history."
-T_IDX = CALIBRATION_DAYS  # day index of the valuation date t
-LAST_IDX = CALIBRATION_DAYS + OOT_DAYS  # day index of t + 30
+assert HISTORY_DAYS >= CALIBRATION_DAYS, "The history must cover at least the calibration window."
+T_IDX = HISTORY_DAYS  # day index of the valuation date t (day 0 = t - HISTORY_DAYS = first loaded day)
+CAL_START_IDX = HISTORY_DAYS - CALIBRATION_DAYS  # day index of t - CALIBRATION_DAYS: first day of the calibration window ("day-1" cohort)
+LAST_IDX = T_IDX + OOT_DAYS  # day index of t + 30
 N_DAYS = LAST_IDX + 1
-DAY_STRIDE = 64  # key = wid * DAY_STRIDE + day; DAY_STRIDE > N_DAYS so keys never cross wallets
+DAY_STRIDE = 128  # key = wid * DAY_STRIDE + day; DAY_STRIDE > N_DAYS so keys never cross wallets
 SPELL_STRIDE = 16  # at most 16 spells per wallet (repay, borrow again, ...); sid = wid * SPELL_STRIDE + spell
 assert DAY_STRIDE > N_DAYS, "Keys would cross wallets."
 
-DAY1_DATE = {key: date - pd.Timedelta(HISTORY_DAYS, unit="D") for key, date in VALUATION_DATE.items()}  # day 0
+DAY0_DATE = {key: date - pd.Timedelta(HISTORY_DAYS, unit="D") for key, date in VALUATION_DATE.items()}  # day 0 (first loaded day)
+CAL_START_DATE = {key: date - pd.Timedelta(CALIBRATION_DAYS, unit="D") for key, date in VALUATION_DATE.items()}  # day CAL_START_IDX
 OOT_END_DATE = {key: date + pd.Timedelta(OOT_DAYS, unit="D") for key, date in VALUATION_DATE.items()}  # day LAST_IDX
 
 PARAM_SYMBOLS = ["WETH", "wstETH", "rETH", "cbETH", "WBTC", "UNI", "LINK", "USDC", "USDT", "DAI"]  # shown in Section 2.4
@@ -192,10 +198,21 @@ BOOTSTRAP_SEED = 20240315
 CI_PERCENTILES = (2.5, 97.5)
 HORIZON_DAYS = 30
 
-# --- Robustness (Sections 12-14) ----------------------------------------------------------------------
-HALF_WINDOW_DAYS = 15
-HOMOGENEITY_ALPHA = 0.05
+# --- Calibration window: sub-windows and out-of-sample selection (Section 12) -----------------------------
+HALF_WINDOW_DAYS = 15  # Section 12.1: days 1-15 versus days 16-30 of [t - 30, t]
 FIRST_HALF, SECOND_HALF = "days_01_15", "days_16_30"
+N_BOOTSTRAP_SUBWINDOW = 200  # wallet-bootstrap replicates of the sub-window intervals (Section 12.1)
+ROLLING_WINDOW_DAYS = 10  # Section 12.1: rolling windows of 10 origin days ...
+ROLLING_STEP_DAYS = 5  # ... ending every 5 days
+HOMOGENEITY_ALPHA = 0.05
+WINDOW_GRID = [5, 7, 10, 14, 21, 30]  # Section 12.2: candidate lengths W of the calibration window (days of transitions)
+SELECTION_ORIGINS = list(range(CAL_START_IDX, T_IDX))  # forecast origins s = t-30, ..., t-1 (only information up to t)
+JEFFREYS_PSEUDOCOUNT = 0.5  # added to every cell of each transient row of the estimation counts (same for every W)
+N_BOOTSTRAP_SELECTION = 500  # wallet-bootstrap replicates of the score (same resampled wallets for every W)
+SELECTION_SEED = 20240315
+assert min(SELECTION_ORIGINS) - max(WINDOW_GRID) >= 0, "The loaded history is too short for the longest candidate window."
+
+# --- Robustness (Sections 13-14) ----------------------------------------------------------------------
 SENSITIVITY_SHIFT = 0.05  # shift of the intermediate HF cut points (Section 13)
 INTERMEDIATE_BOUNDARIES = (1.10, 1.25, 1.50)
 MIN_DEBT_SENSITIVITY_USD = 1000.0
@@ -215,7 +232,7 @@ DATE_FORMAT = "%Y-%m-%d"
 # - `protocol/{reserve_params_daily,emode_categories_daily,daily_blocks}.csv`: LT, LB, LTV, eMode and snapshot blocks.
 # - `prices/aave_oracle_daily.csv`: USD price used by the protocol, one row per (date, reserve).
 #
-# **Date filter.** Each input is restricted to $[t-\text{HISTORY\_DAYS},\, t+\text{OOT\_DAYS}]$ when it is loaded: the position files by the date in their name (before they are read), the other tables by their `date` column. After loading, `assert_in_window` checks that every loaded date lies in the window. On a raw folder that holds exactly the 61 window days the filter changes nothing.
+# **Date filter.** Each input is restricted to $[t-\text{HISTORY\_DAYS},\, t+\text{OOT\_DAYS}]$ when it is loaded: the position files by the date in their name (before they are read), the other tables by their `date` column. After loading, `assert_in_window` checks that every loaded date lies in the window. On a raw folder that holds exactly the 91 window days the filter changes nothing.
 
 # %% [markdown]
 # ### 2.1 Daily positions: loading, inspection and validation
@@ -224,7 +241,7 @@ DATE_FORMAT = "%Y-%m-%d"
 #
 # 1. **Load** the position files of the window, using the file date to skip the days outside it.
 # 2. **Inspect** what the extraction wrote: file groups and sizes, columns, metadata and one day of positions. The last check recomputes the token balances from the scaled balances and the Aave indices (`balance = scaled * index / 1e27 / 10**decimals`) on day $t$, to confirm that the float columns used below are the accrued balances and not the stale `current*` fields of the subgraph (the files store them rounded to 6 decimals).
-# 3. **Validate** the panel: the 61 UTC days $[t-30, t+30]$ are present and consecutive, every day uses the snapshot block of `protocol/daily_blocks.csv`, and there is no duplicated (day, user, reserve) row.
+# 3. **Validate** the panel: the 91 UTC days $[t-60, t+30]$ are present and consecutive, every day uses the snapshot block of `protocol/daily_blocks.csv`, and there is no duplicated (day, user, reserve) row.
 #
 # A wallet is **observed** on a day when it appears in that day's snapshot. The universe is not fixed: wallets enter when they borrow and leave when they repay or are liquidated.
 
@@ -245,7 +262,7 @@ POSITION_DTYPES = {
 
 def assert_in_window(dates: pd.Series, scenario_key: str, name: str) -> None:
     """Every loaded date must lie in [t - HISTORY_DAYS, t + OOT_DAYS]; otherwise day indices and keys are invalid."""
-    first, last = DAY1_DATE[scenario_key], OOT_END_DATE[scenario_key]
+    first, last = DAY0_DATE[scenario_key], OOT_END_DATE[scenario_key]
     assert dates.empty or (dates.min() >= first and dates.max() <= last), (
         f"{scenario_key}: {name} has dates outside the window [{first.date()}, {last.date()}]."
     )
@@ -253,7 +270,7 @@ def assert_in_window(dates: pd.Series, scenario_key: str, name: str) -> None:
 
 def restrict_to_window(table: pd.DataFrame, scenario_key: str, name: str) -> pd.DataFrame:
     """Keep the rows dated inside [t - HISTORY_DAYS, t + OOT_DAYS] (the raw folders may cover more days)."""
-    in_window = table["date"].between(DAY1_DATE[scenario_key], OOT_END_DATE[scenario_key])
+    in_window = table["date"].between(DAY0_DATE[scenario_key], OOT_END_DATE[scenario_key])
     if not in_window.all():
         print(f"[{scenario_key}] {name}: {int((~in_window).sum()):,} of {len(in_window):,} rows lie outside the window and are ignored")
     kept = table.loc[in_window].reset_index(drop=True)
@@ -265,7 +282,7 @@ def position_files(scenario_dir: Path, scenario_key: str) -> list[Path]:
     """Daily positions files whose file date lies in the window [t - HISTORY_DAYS, t + OOT_DAYS]."""
     files = sorted((scenario_dir / "thegraph_daily").glob("positions_*.csv.gz"))
     dated = [(pd.Timestamp(path.name.removeprefix("positions_").removesuffix(".csv.gz")), path) for path in files]
-    return [path for date, path in dated if DAY1_DATE[scenario_key] <= date <= OOT_END_DATE[scenario_key]]
+    return [path for date, path in dated if DAY0_DATE[scenario_key] <= date <= OOT_END_DATE[scenario_key]]
 
 
 def load_positions(scenario_dir: Path, scenario_key: str) -> pd.DataFrame:
@@ -295,7 +312,7 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
     print(
         f"[{scenario_key}] {scenario_label}: {len(positions):,} position rows, "
         f"{positions['date'].nunique()} days, {positions['user_id'].nunique():,} distinct borrowers "
-        f"(window {DAY1_DATE[scenario_key].date()} -> {OOT_END_DATE[scenario_key].date()}; "
+        f"(window {DAY0_DATE[scenario_key].date()} -> {OOT_END_DATE[scenario_key].date()}; "
         f"{len(position_files(scenario_dir, scenario_key))} of {n_files_on_disk} position files read)"
     )
 
@@ -369,9 +386,9 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
 daily_blocks_by_scenario: dict[str, pd.DataFrame] = {}
 for scenario_key, scenario_label in SCENARIO_KEYS:
     positions = positions_by_scenario[scenario_key]
-    expected_days = pd.date_range(DAY1_DATE[scenario_key], OOT_END_DATE[scenario_key], freq="D")
+    expected_days = pd.date_range(DAY0_DATE[scenario_key], OOT_END_DATE[scenario_key], freq="D")
     observed_days = pd.DatetimeIndex(sorted(positions["date"].unique()))
-    assert observed_days.equals(expected_days), f"{scenario_label}: positions days are not the 61 consecutive window days."
+    assert observed_days.equals(expected_days), f"{scenario_label}: positions days are not the 91 consecutive window days."
 
     blocks = pd.read_csv(RAW_DATA_DIR / scenario_label / "protocol" / "daily_blocks.csv", parse_dates=["date"])
     blocks = restrict_to_window(blocks, scenario_key, "daily_blocks")
@@ -403,7 +420,7 @@ for ax, (scenario_key, scenario_label) in zip(axes, SCENARIO_KEYS):
     print(
         f"[{scenario_key}] borrowers per day: min={universe.min():,} median={int(universe.median()):,} max={universe.max():,}"
     )
-    display(universe.iloc[[0, 1, 2, T_IDX - 1, T_IDX, T_IDX + 1, LAST_IDX]].to_frame().T)
+    display(universe.iloc[[0, 1, CAL_START_IDX, T_IDX - 1, T_IDX, T_IDX + 1, LAST_IDX]].to_frame().T)
 
     debt_reserves = (
         positions.loc[(positions["date"] == VALUATION_DATE[scenario_key]) & (positions["variable_debt"] > 0)]
@@ -502,14 +519,14 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
     emodes["date"] = pd.to_datetime(emodes["date"])
     reserves = restrict_to_window(reserves, scenario_key, "reserve_params")
     emodes = restrict_to_window(emodes, scenario_key, "emode_categories")
-    window = pd.date_range(DAY1_DATE[scenario_key], OOT_END_DATE[scenario_key], freq="D")
+    window = pd.date_range(DAY0_DATE[scenario_key], OOT_END_DATE[scenario_key], freq="D")
     assert set(window) <= set(reserves["date"]), f"{scenario_label}: reserve parameters miss window days."
     assert set(window) <= set(emodes["date"]), f"{scenario_label}: eMode parameters miss window days."
     reserve_params[scenario_key] = reserves
     emode_categories[scenario_key] = emodes
 
     rows = {}
-    for label, date in (("day1", DAY1_DATE[scenario_key]), ("t", VALUATION_DATE[scenario_key]), ("t+30", OOT_END_DATE[scenario_key])):
+    for label, date in (("day1", CAL_START_DATE[scenario_key]), ("t", VALUATION_DATE[scenario_key]), ("t+30", OOT_END_DATE[scenario_key])):
         params_day = load_reserve_params(scenario_label, date=str(date.date()), raw_dir=RAW_DATA_DIR)
         rows[f"LT {label}"] = {
             symbol: get_param(params_day, symbol, "liquidation_threshold")
@@ -720,11 +737,16 @@ def classify_dominance(users: pd.DataFrame) -> pd.DataFrame:
 
 user_day = classify_dominance(user_day)
 
-# Integer indices shared by every table below (see Section 1).
+# Integer indices shared by every table below (see Section 1). The wallets seen in the production window
+# [t - CALIBRATION_DAYS, t + OOT_DAYS] are coded first, in order of appearance; the wallets seen only in the earlier
+# history get the following codes. This keeps the production codes (and the wallet order of the seeded bootstrap)
+# identical to a run that only loads the production window.
+user_day["day"] = (user_day["date"] - user_day["scenario"].map(DAY0_DATE)).dt.days.astype("int64")
 wallet_labels = user_day["scenario"] + "|" + user_day["user_id"]
-user_day["wid"], WALLET_UNIQUES = pd.factorize(wallet_labels)
+in_production_window = user_day["day"] >= CAL_START_IDX
+WALLET_UNIQUES = pd.Index(pd.unique(pd.concat([wallet_labels[in_production_window], wallet_labels[~in_production_window]])))
 WALLET_LOOKUP = pd.Series(np.arange(len(WALLET_UNIQUES), dtype="int64"), index=WALLET_UNIQUES)
-user_day["day"] = (user_day["date"] - user_day["scenario"].map(DAY1_DATE)).dt.days.astype("int64")
+user_day["wid"] = WALLET_UNIQUES.get_indexer(wallet_labels).astype("int64")
 user_day["key"] = user_day["wid"].astype("int64") * DAY_STRIDE + user_day["day"]
 user_day = user_day.sort_values("key", kind="mergesort").reset_index(drop=True)
 assert user_day["key"].is_unique, "Duplicated (wallet, day) keys."
@@ -746,7 +768,7 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
 # %% [markdown]
 # ## 5. Minimum debt and the profile panel
 #
-# In both scenarios the panel keeps the user-days that satisfy Profile A and/or B (Section 4) **and** carry at least `MIN_DEBT_USD` of debt.
+# In both scenarios the panel keeps the user-days that satisfy Profile A and/or B (Section 4) **and** carry at least `MIN_DEBT_USD` of debt. `hf_panel_full` holds every loaded day ($[t-60, t+30]$) and is used only by the window selection of Section 12.2; **`hf_panel_df`, the panel of the production pipeline, is restricted to $[t-30, t+30]$** (`production_window`).
 #
 # **Minimum debt.** A user-day enters the profile panel only if `total_debt_usd >= MIN_DEBT_USD` (USD 100). Smaller positions are dust that liquidators ignore, and the previous diagnostic showed that the wallets stuck at $HF \le 1$ were almost all dust. A USD 1,000 minimum is reported as a sensitivity in Section 14.
 #
@@ -773,7 +795,13 @@ def qualifying_panel(users: pd.DataFrame, min_debt_usd: float) -> pd.DataFrame:
     return panel[PANEL_COLUMNS].reset_index(drop=True)
 
 
-hf_panel_df = qualifying_panel(user_day, MIN_DEBT_USD)
+def production_window(panel: pd.DataFrame) -> pd.DataFrame:
+    """Restrict a panel to the production days [t - CALIBRATION_DAYS, t + OOT_DAYS] (day >= CAL_START_IDX)."""
+    return panel.loc[panel["day"] >= CAL_START_IDX].reset_index(drop=True)
+
+
+hf_panel_full = qualifying_panel(user_day, MIN_DEBT_USD)  # every loaded day, history included (Section 12.2)
+hf_panel_df = production_window(hf_panel_full)  # the production panel
 
 assert np.isfinite(hf_panel_df["health_factor"]).all(), "HF is NaN or infinite for a qualifying user-day."
 assert (hf_panel_df["total_collateral_usd"] > 0).all(), "Ghost wallet: debt without collateral."
@@ -790,7 +818,7 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
     per_day = block.groupby("day")["wid"].nunique()
     print(
         f"Profile wallets per day: min={per_day.min():,} median={int(per_day.median()):,} max={per_day.max():,} "
-        f"(day1={per_day.get(0, 0):,}, t={per_day.get(T_IDX, 0):,}, t+30={per_day.get(LAST_IDX, 0):,})"
+        f"(day1={per_day.get(CAL_START_IDX, 0):,}, t={per_day.get(T_IDX, 0):,}, t+30={per_day.get(LAST_IDX, 0):,})"
     )
     assert per_day.nunique() > 1, f"{scenario_key}: the profile universe does not change between days."
     print()
@@ -806,12 +834,17 @@ display(hf_panel_df.head())
 # 1. **Purity filter.** A wallet's profile is the set of daily labels it shows **inside the calibration window** $[t-30, t]$ (days after $t$ are never used to classify a wallet). Hybrid wallets, Profile A on some days and B on others, are dropped; only strictly **A** or **B** wallets remain.
 # 2. **Filter membership.** A pure wallet is *in the filter* on a day when that day's label equals its profile. After $t$ the same rule applies, which lets the out-of-time follow-up use the same definition of "leaving the profile filter".
 #
-# The result, `pure_panel`, is the observation table of the chain: one row per pure wallet and day in the filter.
+# The result, `pure_panel`, is the observation table of the chain: one row per pure wallet and day in the filter. `drop_hybrid_wallets` takes the window of the labels as parameters (by default the production window $[t-30, t]$); Section 12.2 reuses it on other windows.
 
 # %%
-def drop_hybrid_wallets(panel: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    """Keep wallets whose calibration-window labels are all A or all B; return the panel and wallet labels."""
-    calibration = panel.loc[panel["day"] <= T_IDX]
+def drop_hybrid_wallets(
+    panel: pd.DataFrame, first_day: int = CAL_START_IDX, last_day: int = T_IDX
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Keep wallets whose labels on the days [first_day, last_day] are all A or all B; return the panel and wallet labels.
+
+    The defaults are the production calibration window [t - CALIBRATION_DAYS, t]; Section 12.2 passes other windows.
+    """
+    calibration = panel.loc[panel["day"].between(first_day, last_day)]
     flags = calibration.groupby("wid").agg(has_a=("is_profile_a", "max"), has_b=("is_profile_b", "max"))
     wallet_profile = pd.Series(
         np.select([flags["has_a"] & ~flags["has_b"], flags["has_b"] & ~flags["has_a"]], ["A", "B"], default="A,B"),
@@ -865,6 +898,8 @@ print(
 # **Timing of the liquidation trigger.** A snapshot is taken at 00:00 UTC. A real liquidation happens minutes after $HF$ crosses 1 and restores the $HF$ before the next snapshot, so the daily $HF$ alone would miss the event. An event dated $d$ happens between snapshot $d$ and snapshot $d+1$: with `LIQUIDATION_DAY_OFFSET = 0` it is attached to the transition $d \to d+1$, and the wallet is `S7` on day $d+1$ (the first snapshot that follows the event, where its $HF$ is already restored). This keeps the calibration causal: a liquidation that happens after the snapshot of $t$ is not used to calibrate the chain, it belongs to the out-of-time window. Setting `LIQUIDATION_DAY_OFFSET = 1` instead attaches the liquidations dated $d+1$ to the transition $d \to d+1$, so that the state of day $d+1$ is overwritten by the liquidations of day $d+1$ itself (the liquidations of day $t$, which follow the snapshot of $t$, then enter the calibration). **Consequence of the default:** the liquidations of the valuation day itself (in particular the crash day, 2024-08-05, in the stress scenario) fall in the out-of-time period, not in the stress calibration. Repayments are always read the first way (`REPAY_DAY_OFFSET = 0`), because `S1` is defined by the debt that the **next** snapshot shows after the repay.
 #
 # **Repayment threshold.** `DUST_DEBT_USD = 1.0`: a repay event followed by a total debt of at most USD 1 (or by the wallet disappearing from the next snapshot) is `S1`.
+#
+# **Window start.** `assign_day_states` receives the first day of the window the chain is built on (`CAL_START_IDX` for the production chain). A `liquidationCall` whose origin day is before that first day is not used, so the first observation of a window is `S7` only by its own HF and nothing before the window affects the states (the loaded history $[t-60, t-31]$ contains such events, and Section 12.2 builds chains on many other windows).
 
 # %%
 def map_health_factor_to_state(health_factor: pd.Series) -> pd.Series:
@@ -885,7 +920,7 @@ def attach_wallet_codes(events: pd.DataFrame) -> pd.DataFrame:
     """Add the wallet code ``wid`` (NaN for users that never appear in a snapshot) and the day index."""
     out = events.copy()
     out["wid"] = WALLET_LOOKUP.reindex(out["scenario"] + "|" + out["user_id"]).to_numpy()
-    out["day"] = (out["date"] - out["scenario"].map(DAY1_DATE)).dt.days.astype("int64")
+    out["day"] = (out["date"] - out["scenario"].map(DAY0_DATE)).dt.days.astype("int64")
     return out
 
 
@@ -915,15 +950,20 @@ print(
 )
 
 
-def assign_day_states(panel: pd.DataFrame) -> pd.DataFrame:
-    """Observation table with the day-level state: S7 by HF <= 1 or by a liquidationCall, else the HF bin."""
+def assign_day_states(panel: pd.DataFrame, first_day: int = CAL_START_IDX) -> pd.DataFrame:
+    """Observation table with the day-level state: S7 by HF <= 1 or by a liquidationCall, else the HF bin.
+
+    ``first_day`` is the first day of the window the chain is built on. A liquidationCall that happened before it
+    (origin day < first_day) is not used, so that nothing before the window affects the states: the first
+    observation of the window can only be S7 by its own HF.
+    """
     obs = panel.sort_values("key", kind="mergesort").reset_index(drop=True)
     if "state_hf" not in obs.columns:
         obs["state_hf"] = map_health_factor_to_state(obs["health_factor"])
     hf_at_or_below_1 = obs["health_factor"].le(LIQUIDATION_HF_THRESHOLD).to_numpy()
     assert ((obs["state_hf"] == "S7").to_numpy() == hf_at_or_below_1).all(), "S7 bin and HF <= 1 disagree."
     key = obs["key"].to_numpy()
-    liq_landing = np.isin(key - 1, LIQ_ORIGIN_KEYS)  # a liquidationCall in the interval that ends on this day
+    liq_landing = np.isin(key - 1, LIQ_ORIGIN_KEYS) & (obs["day"].to_numpy() > first_day)  # a liquidationCall in the interval that ends on this day
     obs["s7_trigger"] = np.where(hf_at_or_below_1, "S7_hf", np.where(liq_landing, "S7_liquidation_call", ""))
     obs["state"] = np.where(obs["s7_trigger"] != "", "S7", obs["state_hf"])
     return obs
@@ -968,7 +1008,7 @@ for (scenario_key, profile), block in calibration_states.groupby(["scenario", "p
 #
 # `exit_reason` takes five values: `S1_repay`, `S7_hf`, `S7_liquidation_call`, `censored_filter_exit`, `censored_window_end`. Section 9 compares the Health Factor at censoring with the other wallets to look for informative censoring.
 #
-# The same function runs over the 61 days. Calibration only keeps landings on day $\le t$; the out-of-time outcome of Section 15 uses the landings in $(t, t+30]$.
+# The same function runs over the 61 days of the production panel $[t-30, t+30]$. Calibration only keeps landings on day $\le t$; the out-of-time outcome of Section 15 uses the landings in $(t, t+30]$.
 
 # %%
 def lookup_snapshot(values: np.ndarray, query_keys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1082,11 +1122,13 @@ def first_absorption(events: pd.DataFrame, first_day: int, last_day: int) -> pd.
     return first.set_index("sid")[["landing", "type"]]
 
 
-def summarise_wallets(trajectories: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """One row per spell observed in the calibration window: outcome, exit_reason and last observation."""
+def summarise_wallets(
+    trajectories: dict[str, pd.DataFrame], window_first: int = CAL_START_IDX, window_last: int = T_IDX
+) -> pd.DataFrame:
+    """One row per spell observed in the calibration window [window_first, window_last]: outcome, exit_reason and last observation."""
     obs = trajectories["obs"]
-    calibration = obs.loc[obs["day"] <= T_IDX]
-    first_hit = first_absorption(trajectories["events"], 0, T_IDX)
+    calibration = obs.loc[obs["day"].between(window_first, window_last)]
+    first_hit = first_absorption(trajectories["events"], window_first, window_last)
 
     grouped = calibration.groupby("sid", sort=True)
     summary = grouped.agg(
@@ -1114,7 +1156,7 @@ def summarise_wallets(trajectories: dict[str, pd.DataFrame]) -> pd.DataFrame:
     summary["exit_reason"] = np.where(
         absorbed,
         summary["type"],
-        np.where(summary["last_day"] == T_IDX, "censored_window_end", "censored_filter_exit"),
+        np.where(summary["last_day"] == window_last, "censored_window_end", "censored_filter_exit"),
     )
     summary["final_state"] = np.select(
         [summary["type"] == "S1_repay", summary["type"].isin(["S7_hf", "S7_liquidation_call"])],
@@ -1122,18 +1164,24 @@ def summarise_wallets(trajectories: dict[str, pd.DataFrame]) -> pd.DataFrame:
         default=calibration.groupby("sid").tail(1).set_index("sid")["state"].reindex(summary.index),
     )
     summary["event_day"] = np.where(absorbed, summary["landing"], summary["last_day"]).astype("int64")
-    summary["is_late_entrant"] = summary["first_day"] > 0
+    summary["is_late_entrant"] = summary["first_day"] > window_first
     return summary
 
 
-def counted_transitions(trajectories: dict[str, pd.DataFrame], summary: pd.DataFrame) -> pd.DataFrame:
-    """Calibration transitions: from transient observations, before the first absorption of their spell."""
+def counted_transitions(
+    trajectories: dict[str, pd.DataFrame], summary: pd.DataFrame, window_last: int = T_IDX
+) -> pd.DataFrame:
+    """Calibration transitions: from transient observations, before the first absorption of their spell.
+
+    ``summary`` only needs the ``landing`` day of the first absorption of each spell (indexed by ``sid``).
+    A transition counts when its landing day is <= ``window_last``.
+    """
     obs = trajectories["obs"]
     landing = summary["landing"].reindex(obs["sid"]).to_numpy()
     before_absorption = np.isnan(landing) | (obs["day"].to_numpy() < landing)
     counted = (
         obs["outcome"].isin(["S7_hf", "S7_liquidation_call", "S1_repay", "transient"])
-        & (obs["day"] + 1 <= T_IDX)
+        & (obs["day"] + 1 <= window_last)
         & before_absorption
     )
     transitions = obs.loc[counted, ["scenario", "user_id", "wid", "sid", "profile", "date", "day", "state", "next_state"]].copy()
@@ -1142,16 +1190,25 @@ def counted_transitions(trajectories: dict[str, pd.DataFrame], summary: pd.DataF
     return transitions.reset_index(drop=True)
 
 
-def run_chain(panel: pd.DataFrame) -> dict:
-    """Sections 7 and 8 end to end for any observation panel (used by the sensitivities of Part E)."""
-    trajectories = build_trajectories(assign_day_states(panel))
-    summary = summarise_wallets(trajectories)
-    return {"traj": trajectories, "summary": summary, "transitions": counted_transitions(trajectories, summary)}
+def run_chain(
+    panel: pd.DataFrame, window_first: int = CAL_START_IDX, window_last: int = T_IDX, full_summary: bool = True
+) -> dict:
+    """Sections 7 and 8 end to end for any observation panel (used by the sensitivities and the window selection of Part E).
+
+    The chain is calibrated on the days [window_first, window_last] of ``panel``: events before ``window_first``
+    are ignored, and a transition counts when it lands on a day <= ``window_last``. The defaults are the production
+    window [t - CALIBRATION_DAYS, t]. With ``full_summary = False`` the per-spell summary is replaced by the first
+    absorption of each spell (the only part the transitions need), which is much faster.
+    """
+    trajectories = build_trajectories(assign_day_states(panel, window_first))
+    if full_summary:
+        summary = summarise_wallets(trajectories, window_first, window_last)
+    else:
+        summary = first_absorption(trajectories["events"], window_first, window_last)
+    return {"traj": trajectories, "summary": summary, "transitions": counted_transitions(trajectories, summary, window_last)}
 
 
-chain = {"traj": build_trajectories(day_states)}
-chain["summary"] = summarise_wallets(chain["traj"])
-chain["transitions"] = counted_transitions(chain["traj"], chain["summary"])
+chain = run_chain(pure_panel)  # production window [t - 30, t]; the days (t, t + 30] stay in the trajectories for the OOT outcome
 
 wallet_summary = chain["summary"]
 markov_transitions_df = chain["transitions"]
@@ -1262,7 +1319,7 @@ assert not wallet_summary.loc[wallet_summary["exit_reason"] == "censored_filter_
 assert wallet_summary.loc[wallet_summary["exit_reason"].str.startswith("censored"), "final_state"].isin(TRANSIENT_STATES).all()
 
 absorbed_wallets = wallet_summary.loc[wallet_summary["type"].notna()].copy()
-absorbed_wallets["event_date"] = absorbed_wallets["scenario"].map(DAY1_DATE) + pd.to_timedelta(absorbed_wallets["event_day"], unit="D")
+absorbed_wallets["event_date"] = absorbed_wallets["scenario"].map(DAY0_DATE) + pd.to_timedelta(absorbed_wallets["event_day"], unit="D")
 origin_date = absorbed_wallets["event_date"] - pd.Timedelta(1, unit="D")
 
 
@@ -1444,7 +1501,7 @@ detail_columns = [
     "scenario", "profile", "user_id", "first_day", "landing", "type", "entry_class",
     "origin_debt_usd", "origin_eth_share", "origin_uni_link_share",
 ]  # fmt: skip
-no_entry_day1 = s7_spells.loc[(s7_spells["first_day"] == 0) & (s7_spells["entry_class"] != "entry_transition_in_N"), detail_columns]
+no_entry_day1 = s7_spells.loc[(s7_spells["first_day"] == CAL_START_IDX) & (s7_spells["entry_class"] != "entry_transition_in_N"), detail_columns]
 print(f"\nDay-1 cohort wallets that end in S7 without an entry transition in N: {len(no_entry_day1):,}")
 if len(no_entry_day1):
     display(no_entry_day1.round(3).reset_index(drop=True))
@@ -1777,21 +1834,24 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
         display(ci_table.round(6))
 
 # %% [markdown]
-# # Part E. Robustness
+# # Part E. Robustness and calibration window
 #
-# Three checks on the estimates of Part D. They reuse `STATE_ORDER`, `SCENARIO_KEYS`, `PROFILE_KEYS`, `PROFILE_TITLES`, `build_empirical_transition_matrices` and `subset_transitions` from Section 10, `horizon_pd` from Section 11, `run_chain` from Section 8 and `HF_STATE_BINS` / `HF_STATE_LABELS` from Section 1: time homogeneity of $\mathbf{P}$ (Section 12), sensitivity to the Health Factor cut points (Section 13) and sensitivity to the minimum debt (Section 14).
+# Three checks on the estimates of Part D. They reuse `STATE_ORDER`, `SCENARIO_KEYS`, `PROFILE_KEYS`, `PROFILE_TITLES`, `build_empirical_transition_matrices` and `subset_transitions` from Section 10, `horizon_pd` and `wallet_bootstrap_s7_ci` from Section 11, `run_chain` and `drop_hybrid_wallets` from Sections 6 and 8, and `HF_STATE_BINS` / `HF_STATE_LABELS` from Section 1: the calibration window, with a sub-window comparison and an out-of-sample selection of its length (Section 12), the sensitivity to the Health Factor cut points (Section 13) and the sensitivity to the minimum debt (Section 14).
 #
-# ## 12. Time-homogeneity check
+# ## 12. Calibration window: sub-window comparison and out-of-sample selection
 #
-# The $\mathbf{P}^{30}$ projection assumes the daily matrix is constant within the 30-day horizon. Transitions are split by the date of day $t$ (the origin of the transition): days 1-15 of the calibration window versus days 16-30. $\mathbf{P}$ is estimated on each half and shown side by side, together with the difference (days 16-30 minus days 1-15).
+# The $\mathbf{P}^{30}$ projection assumes a daily matrix that does not change, and the matrix is estimated on a window whose length (30 days) is a design choice. Two questions follow. Do the probabilities change radically between sub-windows of the calibration window (the tutor asked for this check; Section 12.1)? And is 30 days a good length, judged by out-of-sample predictions that use only the information available at each date (Section 12.2)? Section 12.3 shows how much the PD moves with the selected length.
 #
-# For each transient origin state $i$ (`S2` to `S6`) the Anderson-Goodman likelihood-ratio statistic compares the two halves:
+# **Scope.** `CALIBRATION_DAYS` stays 30: every production table and both exports keep using $[t-30, t]$ until the author and the tutor decide otherwise. The 30 extra days of history $[t-60, t-31]$ are used **only** by this section, and only to select the window length. The selection criterion is **one day ahead** (the next-day transition); the 30-day projection is assessed by the out-of-time backtest, not here.
+
+# %% [markdown]
+# ### 12.1 Sub-window comparison
 #
-# $$G^2_i = 2 \sum_{h=1}^{2} \sum_{j} n_{hij} \ln \frac{n_{hij}}{\hat{E}_{hij}}, \qquad \hat{E}_{hij} = \frac{n_{hi\cdot}\, n_{\cdot ij}}{n_{\cdot i \cdot}}$$
+# The transitions of the production window are split by the date of their origin day: days 1-15 ($t-30$ to $t-16$) versus days 16-30 ($t-15$ to $t-1$). $\mathbf{P}$ is estimated on each half and the 30-day PD of every transient origin state, $\text{PD}_i = [\mathbf{P}^{30}]_{i,S7}$, is shown side by side with its 95% wallet-bootstrap interval (the bootstrap of Section 11.2 applied to each half, $B$ = `N_BOOTSTRAP_SUBWINDOW` = 200). An origin state without a single transition in a half is not estimated and is left empty. The figure uses a symmetric-log axis because the PD runs from almost 0 (`S2`) to the order of 1 (`S6`).
 #
-# with $K_i - 1$ degrees of freedom, where $K_i$ is the number of next states observed from $i$. A pooled statistic sums $G^2_i$ and the degrees of freedom across the testable transient rows.
+# Second, **rolling windows** of `ROLLING_WINDOW_DAYS` = 10 origin days that end every `ROLLING_STEP_DAYS` = 5 days give the point 30-day PD by state, to see whether the estimate drifts through the window. The halves and the rolling windows are subsets of the transitions of Section 8, not new chains.
 #
-# `S1` and `S7` are excluded from the test: they are absorbing by definition and their rows are the identity in both halves. A transient row observed in only one half is not testable and its row difference is left empty. Within-wallet dependence makes the chi-square reference approximate (p-values tend to be too small on large samples), so the test is read together with the size of the differences (`max_abs_row_diff`).
+# The Anderson-Goodman likelihood-ratio test of equal rows across the two halves (pooled over the testable transient rows) is kept as a compact table at the end. It is a side note: within-wallet dependence makes its p-values too small on large samples, and a significant test does not say whether the PD moves enough to matter, which is what the intervals show.
 
 # %%
 def chi2_sf(statistic: float, dof: int) -> float:
@@ -1800,9 +1860,8 @@ def chi2_sf(statistic: float, dof: int) -> float:
 
 
 def label_window_half(transitions: pd.DataFrame) -> pd.Series:
-    """Label each transition by the half of the calibration window that contains day t."""
-    split_date = transitions["scenario"].map(DAY1_DATE) + pd.to_timedelta(HALF_WINDOW_DAYS, unit="D")
-    is_first_half = transitions["date"].lt(split_date)
+    """Label each calibration transition by the half of the window [t - 30, t] that contains its origin day."""
+    is_first_half = (transitions["day"] - CAL_START_IDX) < HALF_WINDOW_DAYS
     return pd.Series(
         np.where(is_first_half, FIRST_HALF, SECOND_HALF),
         index=transitions.index,
@@ -1817,7 +1876,11 @@ def homogeneity_lr_test(
     p_second: pd.DataFrame,
     origin_states: list[str] = TRANSIENT_STATES,
 ) -> pd.DataFrame:
-    """Anderson-Goodman likelihood-ratio test of equal transition rows across two periods."""
+    """Anderson-Goodman likelihood-ratio test of equal transition rows across two periods.
+
+    For each transient origin state i: G2_i = 2 * sum_h sum_j n_hij * ln(n_hij / E_hij), with E_hij = n_hi. * n_.ij / n_.i.
+    and K_i - 1 degrees of freedom (K_i = next states observed from i). The last row pools the testable states.
+    """
     records = []
     for origin in origin_states:
         table = np.vstack(
@@ -1877,45 +1940,483 @@ def homogeneity_lr_test(
     return result
 
 
-transitions_by_half = markov_transitions_df.assign(window_half=label_window_half(markov_transitions_df))
-homogeneity_P: dict[tuple[str, str], dict[str, pd.DataFrame]] = {}
-homogeneity_tests: dict[tuple[str, str], pd.DataFrame] = {}
+HALVES = (FIRST_HALF, SECOND_HALF)
+HALF_TITLES = {FIRST_HALF: "Days 1-15", SECOND_HALF: "Days 16-30"}
+HALF_COLORS = {FIRST_HALF: "#4C72B0", SECOND_HALF: "#DD8452"}
+PD_COLUMN = f"pd_{HORIZON_DAYS}d"
 
+transitions_by_half = markov_transitions_df.assign(window_half=label_window_half(markov_transitions_df))
+subwindow_records, homogeneity_pooled = [], []
 for scenario_key, scenario_label in SCENARIO_KEYS:
     for profile in PROFILE_KEYS:
         subset = subset_transitions(transitions_by_half, scenario_key, profile)
-        n_first, p_first = build_empirical_transition_matrices(subset.loc[subset["window_half"].eq(FIRST_HALF)])
-        n_second, p_second = build_empirical_transition_matrices(subset.loc[subset["window_half"].eq(SECOND_HALF)])
-        p_diff = p_second - p_first
-        homogeneity_P[(scenario_label, profile)] = {
-            FIRST_HALF: p_first,
-            SECOND_HALF: p_second,
-            "difference": p_diff,
-        }
-        test_table = homogeneity_lr_test(n_first, n_second, p_first, p_second)
-        homogeneity_tests[(scenario_label, profile)] = test_table
+        counts_half, p_half, pd_half, ci_half = {}, {}, {}, {}
+        for half in HALVES:
+            half_subset = subset.loc[subset["window_half"].eq(half)]
+            counts_half[half], p_half[half] = build_empirical_transition_matrices(half_subset)
+            pd_half[half] = horizon_pd(p_half[half])
+            ci_half[half] = wallet_bootstrap_s7_ci(half_subset, n_bootstrap=N_BOOTSTRAP_SUBWINDOW)
 
-        diff_limit = max(float(p_diff.abs().to_numpy().max()), 0.01)
-        panels = [
-            (p_first, f"Days 1-15  (N={int(n_first.to_numpy().sum()):,})", "Blues", 0.0, 1.0),
-            (p_second, f"Days 16-30  (N={int(n_second.to_numpy().sum()):,})", "Blues", 0.0, 1.0),
-            (p_diff, "Difference (days 16-30 minus days 1-15)", "RdBu_r", -diff_limit, diff_limit),
-        ]
-        fig, axes = plt.subplots(1, 3, figsize=(22, 6))
-        for ax, (matrix, subtitle, cmap, vmin, vmax) in zip(axes, panels):
-            sns.heatmap(matrix, ax=ax, annot=True, fmt=".4f", cmap=cmap, vmin=vmin, vmax=vmax, linewidths=0.4)
-            ax.set_title(subtitle)
-            ax.set_xlabel("Next state")
-            ax.set_ylabel("Current state")
-        fig.suptitle(
-            f"Time-homogeneity check  |  {scenario_label}  |  {PROFILE_TITLES[profile]}",
-            fontsize=14,
+        test_table = homogeneity_lr_test(counts_half[FIRST_HALF], counts_half[SECOND_HALF], p_half[FIRST_HALF], p_half[SECOND_HALF])
+        homogeneity_pooled.append(
+            {"scenario": scenario_label, "profile": profile}
+            | test_table.loc["pooled_transient", ["g_statistic", "dof", "p_value", "max_abs_row_diff", "homogeneous_at_5pct"]].to_dict()
         )
-        plt.tight_layout()
-        plt.show()
 
-        print(f"{scenario_label} | {PROFILE_TITLES[profile]}: likelihood-ratio test by origin state")
-        display(test_table.round(6))
+        for state in TRANSIENT_STATES:
+            record = {"scenario": scenario_label, "profile": profile, "current_state": state}
+            for half in HALVES:
+                depth = int(counts_half[half].loc[state].sum())
+                estimated = depth > 0
+                record[f"n_{half}"] = depth
+                record[f"{PD_COLUMN}_{half}"] = pd_half[half][state] if estimated else np.nan
+                record[f"ci_low_{half}"] = ci_half[half].loc[state, f"{PD_COLUMN}_ci_low"] if estimated else np.nan
+                record[f"ci_high_{half}"] = ci_half[half].loc[state, f"{PD_COLUMN}_ci_high"] if estimated else np.nan
+            subwindow_records.append(record)
+
+subwindow_table = pd.DataFrame(subwindow_records).set_index(["scenario", "profile", "current_state"])
+overlap_low = np.maximum(subwindow_table[f"ci_low_{FIRST_HALF}"], subwindow_table[f"ci_low_{SECOND_HALF}"])
+overlap_high = np.minimum(subwindow_table[f"ci_high_{FIRST_HALF}"], subwindow_table[f"ci_high_{SECOND_HALF}"])
+subwindow_table["intervals_overlap"] = np.select(
+    [overlap_low.isna() | overlap_high.isna(), overlap_low <= overlap_high], ["not comparable", "yes"], default="no"
+)
+print(
+    f"{HORIZON_DAYS}-day PD by origin state, calibration transitions split by origin day "
+    f"(95% wallet-bootstrap intervals, B={N_BOOTSTRAP_SUBWINDOW}):"
+)
+display(subwindow_table.round(5))
+comparable = subwindow_table["intervals_overlap"] != "not comparable"
+print(
+    f"Intervals overlap in {int((subwindow_table['intervals_overlap'] == 'yes').sum())} of {int(comparable.sum())} "
+    f"comparable (segment, state) cells; the others are listed above ('no')."
+)
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 9), sharey=True)
+for ax, ((scenario_key, scenario_label), profile) in zip(
+    axes.ravel(), [(scenario, profile) for scenario in SCENARIO_KEYS for profile in PROFILE_KEYS]
+):
+    block = subwindow_table.loc[(scenario_label, profile)]
+    positions = np.arange(len(TRANSIENT_STATES))
+    for shift, half in ((-0.12, FIRST_HALF), (0.12, SECOND_HALF)):
+        point = block[f"{PD_COLUMN}_{half}"].to_numpy(dtype=float)
+        low, high = block[f"ci_low_{half}"].to_numpy(dtype=float), block[f"ci_high_{half}"].to_numpy(dtype=float)
+        ax.errorbar(
+            positions + shift,
+            point,
+            yerr=[np.clip(point - low, 0.0, None), np.clip(high - point, 0.0, None)],
+            fmt="o",
+            color=HALF_COLORS[half],
+            capsize=3,
+            label=HALF_TITLES[half],
+        )
+    ax.set_xticks(positions)
+    ax.set_xticklabels(TRANSIENT_STATES)
+    ax.set_yscale("symlog", linthresh=1e-3)
+    ax.set_ylim(0.0, 1.05)
+    ax.set_title(f"{scenario_label} | {PROFILE_TITLES[profile]}")
+    ax.set_xlabel("Origin state")
+    ax.set_ylabel(f"{HORIZON_DAYS}-day PD (symlog)")
+    ax.legend()
+fig.suptitle(f"PD by origin state: days 1-15 versus days 16-30 of [t-30, t] (95% wallet-bootstrap, B={N_BOOTSTRAP_SUBWINDOW})", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# %%
+ROLLING_ENDS = list(range(ROLLING_WINDOW_DAYS - 1, CALIBRATION_DAYS, ROLLING_STEP_DAYS))  # offsets (0 = day 1) of the last origin day
+
+
+def rolling_label(end_offset: int) -> str:
+    """Label of the rolling window by the calibration days (1-based) of its first and last landing day."""
+    return f"days_{end_offset - ROLLING_WINDOW_DAYS + 2:02d}_{end_offset + 1:02d}"
+
+
+rolling_records = []
+for scenario_key, scenario_label in SCENARIO_KEYS:
+    for profile in PROFILE_KEYS:
+        subset = subset_transitions(markov_transitions_df, scenario_key, profile)
+        origin_offset = subset["day"] - CAL_START_IDX
+        for end_offset in ROLLING_ENDS:
+            window_subset = subset.loc[origin_offset.between(end_offset - ROLLING_WINDOW_DAYS + 1, end_offset)]
+            counts_roll, p_roll = build_empirical_transition_matrices(window_subset)
+            pd_roll = horizon_pd(p_roll)
+            for state in TRANSIENT_STATES:
+                depth = int(counts_roll.loc[state].sum())
+                rolling_records.append(
+                    {
+                        "scenario": scenario_label,
+                        "profile": profile,
+                        "current_state": state,
+                        "window": rolling_label(end_offset),
+                        "end_day": end_offset + 1,
+                        "n": depth,
+                        "pd30": pd_roll[state] if depth > 0 else np.nan,
+                    }
+                )
+rolling = pd.DataFrame(rolling_records)
+rolling_pd = rolling.pivot_table(index=["scenario", "profile", "current_state"], columns="window", values="pd30", dropna=False)
+rolling_n = rolling.pivot_table(index=["scenario", "profile", "current_state"], columns="window", values="n", aggfunc="sum")
+print(f"Point {HORIZON_DAYS}-day PD by origin state: rolling windows of {ROLLING_WINDOW_DAYS} origin days ending every {ROLLING_STEP_DAYS} days (calibration days of the landing dates)")
+display(rolling_pd.round(5))
+print("Transitions behind each cell:")
+display(rolling_n.astype(int))
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 9), sharey=True)
+for ax, ((scenario_key, scenario_label), profile) in zip(
+    axes.ravel(), [(scenario, profile) for scenario in SCENARIO_KEYS for profile in PROFILE_KEYS]
+):
+    block = rolling.loc[(rolling["scenario"] == scenario_label) & (rolling["profile"] == profile)]
+    for state in TRANSIENT_STATES:
+        line = block.loc[block["current_state"] == state].sort_values("end_day")
+        ax.plot(line["end_day"], line["pd30"], marker="o", label=state)
+    ax.set_yscale("symlog", linthresh=1e-3)
+    ax.set_ylim(0.0, 1.05)
+    ax.set_xticks([end + 1 for end in ROLLING_ENDS])
+    ax.set_title(f"{scenario_label} | {PROFILE_TITLES[profile]}")
+    ax.set_xlabel(f"Last day of the {ROLLING_WINDOW_DAYS}-day window (day 1 = t-30)")
+    ax.set_ylabel(f"{HORIZON_DAYS}-day PD (symlog)")
+    ax.legend(title="Origin state", ncol=5, fontsize=8)
+fig.suptitle(f"Point PD by origin state: rolling {ROLLING_WINDOW_DAYS}-day windows ending every {ROLLING_STEP_DAYS} days", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# %%
+homogeneity_summary = pd.DataFrame(homogeneity_pooled).set_index(["scenario", "profile"])
+print("Anderson-Goodman test, days 1-15 versus days 16-30, pooled over the testable transient rows (side note):")
+display(homogeneity_summary.round(5))
+print(
+    "Note: the test rejects equality when the p-value is below 5%, but within-wallet dependence inflates the statistic on large samples; "
+    "read it together with max_abs_row_diff and the intervals above."
+)
+
+# %% [markdown]
+# ### 12.2 Out-of-sample selection of the window length
+#
+# **Question.** A short window follows the current regime but rests on few transitions (the sparse profile B suffers most); a long window has more data but mixes regimes. The selection is a rolling-origin forecast evaluation that uses only the information available at each origin.
+#
+# **Design.**
+#
+# 1. **Origins and windows.** The origins are $s \in \{t-30, \dots, t-1\}$ (`SELECTION_ORIGINS`), so nothing after $t$ is used. For every origin $s$ and every candidate length $W \in$ `WINDOW_GRID` $= \{5, 7, 10, 14, 21, 30\}$ the chain is rebuilt with the rules of Sections 6-8 (`window_transitions`, which calls `drop_hybrid_wallets` and `run_chain`) on the panel truncated to $[s-W,\, s+1]$, so that nothing before the window affects it: the profile of a wallet is the set of labels it shows on $[s-W, s]$, a `liquidationCall` before $s-W$ is not used (Section 7), and the spells, late entrants, exclusion after `S7` and censoring of Section 8 act inside the window. The earliest window starts at $t-60$.
+# 2. **Estimation and evaluation transitions.** *Estimation*: the transitions with origin day in $[s-W, s-1]$; $\hat{\mathbf{P}}$ is estimated from them for each scenario and profile. *Evaluation*: the transitions with origin day $s$ (transient origins `S2`-`S6` only), each with its realised next state on $s+1$.
+# 3. **Estimator.** A Jeffreys pseudo-count of `JEFFREYS_PSEUDOCOUNT` = 0.5 is added to each of the 7 cells of every transient row, the same for every $W$: $\hat P_{ij} = (n_{ij} + 0.5)/(n_{i\cdot} + 3.5)$. It keeps every probability positive so that the log score is defined even for a transition that the window never showed.
+# 4. **Score.** The **log score** is the mean of $\ln \hat P_{i \to j}$ over the evaluation transitions (higher is better). The **multi-class Brier score**, $\sum_k (\hat P_{ik} - \mathbb{1}\{k = j\})^2$, is the secondary metric (lower is better).
+# 5. **Common evaluation set.** The rules of Section 8 can drop a wallet from a long window and keep it in a short one (a wallet that is hybrid over the long window, or that reappears after an `S7`). To compare the lengths on the same events, at each origin only the evaluation transitions that exist for every $W$ of the grid are scored; the number of transitions left out is reported.
+# 6. **Standard error.** The log score of each $W$ is accumulated per wallet (summed over origins, since one wallet is evaluated at several origins and those are dependent) and the wallets are resampled with replacement (`N_BOOTSTRAP_SELECTION` = 500 replicates). A replicate is one vector of multinomial weights **shared by all $W$**, so the differences between lengths are paired.
+#
+# **Decision rule (one $W$ for both profiles and both scenarios).** The total score pools all the evaluation transitions of profiles A and B in both scenarios, each segment scored with its own $\hat{\mathbf{P}}$. Let $W_{best}$ be the length with the highest total mean log score and $\Delta_W$ the paired difference of the mean log score between $W_{best}$ and $W$, with bootstrap standard error $\text{SE}(\Delta_W)$. The selected length $W^*$ is the **longest** $W$ with $\Delta_W \le \text{SE}(\Delta_W)$ (the "1-SE rule"). Among lengths that cannot be told apart from the best, the longest is preferred for its stability, and because it protects the sparse profile B. The curves by scenario and profile are diagnostics; they do not enter the rule.
+
+# %%
+SELECTION_COLUMNS = ["scenario", "user_id", "wid", "date", "day", "key", "profile", "is_profile_a", "is_profile_b", "health_factor"]
+selection_panel = hf_panel_full[SELECTION_COLUMNS].copy()  # every loaded day, history included
+selection_panel["state_hf"] = map_health_factor_to_state(selection_panel["health_factor"])  # a pure function of the HF
+
+SEGMENTS = [(scenario_key, profile) for scenario_key, _ in SCENARIO_KEYS for profile in PROFILE_KEYS]
+SEGMENT_NAMES = [f"{SCENARIO_LABEL[scenario_key]} | {profile}" for scenario_key, profile in SEGMENTS]
+N_SEGMENTS = len(SEGMENTS)
+SCENARIO_CODE = {scenario_key: code for code, (scenario_key, _) in enumerate(SCENARIO_KEYS)}
+PROFILE_CODE = {profile: code for code, profile in enumerate(PROFILE_KEYS)}
+TRANSIENT_IDX = np.array([STATE_INDEX[state] for state in TRANSIENT_STATES])
+ROW_OF_STATE = np.full(N_STATES, -1)
+ROW_OF_STATE[TRANSIENT_IDX] = np.arange(len(TRANSIENT_IDX))
+
+
+def window_transitions(first_day: int, last_day: int, label_last_day: int) -> pd.DataFrame:
+    """Counted transitions of the chain built on the days [first_day, last_day] of the whole loaded panel.
+
+    Same rules as the production chain (Sections 6-8): the wallet profile is the set of labels on
+    [first_day, label_last_day] (hybrid wallets are dropped), liquidations before ``first_day`` are not used, and a
+    transition counts when it lands on a day <= ``last_day``. Nothing outside the window affects the result.
+    """
+    window = selection_panel.loc[selection_panel["day"].between(first_day, last_day)]
+    pure, _ = drop_hybrid_wallets(window, first_day, label_last_day)
+    return run_chain(pure, first_day, last_day, full_summary=False)["transitions"]
+
+
+def encode_transitions(transitions: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Integer codes of the transitions: wallet, origin day, segment (scenario x profile), origin and next state."""
+    scenario_code = transitions["scenario"].map(SCENARIO_CODE)
+    profile_code = transitions["profile"].map(PROFILE_CODE)
+    return {
+        "wid": transitions["wid"].to_numpy(dtype=np.int64),
+        "day": transitions["day"].to_numpy(dtype=np.int64),
+        "segment": (scenario_code * len(PROFILE_KEYS) + profile_code).to_numpy(dtype=np.int64),
+        "origin": transitions["state"].map(STATE_INDEX).to_numpy(dtype=np.int64),
+        "target": transitions["next_state"].map(STATE_INDEX).to_numpy(dtype=np.int64),
+    }
+
+
+def segment_count_matrices(segment: np.ndarray, origin: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Count matrices N of every segment, shape (segments, K, K)."""
+    flat = (segment * N_STATES + origin) * N_STATES + target
+    return np.bincount(flat, minlength=N_SEGMENTS * N_STATES * N_STATES).reshape(N_SEGMENTS, N_STATES, N_STATES).astype(np.float64)
+
+
+def jeffreys_transient_rows(counts: np.ndarray, pseudo_count: float = JEFFREYS_PSEUDOCOUNT) -> np.ndarray:
+    """Rows S2-S6 of P_hat with a pseudo-count on each of the K cells of the row, shape (segments, 5, K)."""
+    smoothed = counts[:, TRANSIENT_IDX, :] + pseudo_count
+    return smoothed / smoothed.sum(axis=-1, keepdims=True)
+
+
+def fit_and_score(window_length: int, origin_day: int) -> dict[str, np.ndarray]:
+    """Estimate P_hat on the window [s - W, s + 1] (origin days < s) and score the transitions that start on day s."""
+    transitions = window_transitions(origin_day - window_length, origin_day + 1, origin_day)
+    coded = encode_transitions(transitions)
+    estimation = coded["day"] < origin_day
+    evaluation = coded["day"] == origin_day
+    counts = segment_count_matrices(coded["segment"][estimation], coded["origin"][estimation], coded["target"][estimation])
+    p_hat = jeffreys_transient_rows(counts)
+
+    segment, origin, target = (coded[name][evaluation] for name in ("segment", "origin", "target"))
+    row = ROW_OF_STATE[origin]
+    assert (row >= 0).all(), "An evaluation transition starts in an absorbing state."
+    probabilities = p_hat[segment, row]  # (n_eval, K): the predicted row of each evaluation transition
+    realised = probabilities[np.arange(len(target)), target]
+    return {
+        "wid": coded["wid"][evaluation],
+        "segment": segment,
+        "origin": origin,
+        "target": target,
+        "log_score": np.log(realised),
+        "brier": (probabilities**2).sum(axis=1) - 2.0 * realised + 1.0,
+        "n_estimation": np.array([int(estimation.sum())]),
+    }
+
+
+selection_results: dict[tuple[int, int], dict[str, np.ndarray]] = {}
+build_seconds: list[float] = []
+for window_length in WINDOW_GRID:
+    for origin_day in SELECTION_ORIGINS:
+        started = time.perf_counter()
+        selection_results[(origin_day, window_length)] = fit_and_score(window_length, origin_day)
+        build_seconds.append(time.perf_counter() - started)
+n_builds = len(build_seconds)
+print(
+    f"{n_builds} chain builds ({len(WINDOW_GRID)} lengths x {len(SELECTION_ORIGINS)} origins): {sum(build_seconds):.1f} s in total, "
+    f"{np.mean(build_seconds):.2f} s per build on average (min {min(build_seconds):.2f}, max {max(build_seconds):.2f}) "
+    f"[{'sample' if IS_SAMPLE_RUN else 'full data'} run]"
+)
+
+# %%
+# Common evaluation set: at each origin keep the wallets evaluated under every W, in the same (sorted) order.
+aligned: dict[int, dict[str, list[np.ndarray]]] = {w: {name: [] for name in ("wid", "segment", "origin", "target", "log_score", "brier", "day")} for w in WINDOW_GRID}
+n_all = dict.fromkeys(WINDOW_GRID, 0)
+for origin_day in SELECTION_ORIGINS:
+    results = {w: selection_results[(origin_day, w)] for w in WINDOW_GRID}
+    for w, result in results.items():
+        assert len(np.unique(result["wid"])) == len(result["wid"]), "A wallet has two evaluation transitions at one origin."
+        n_all[w] += len(result["wid"])
+    common = reduce(np.intersect1d, [result["wid"] for result in results.values()])
+    reference = None
+    for w, result in results.items():
+        keep = np.flatnonzero(np.isin(result["wid"], common))
+        keep = keep[np.argsort(result["wid"][keep], kind="stable")]
+        for name in ("wid", "segment", "origin", "target", "log_score", "brier"):
+            aligned[w][name].append(result[name][keep])
+        aligned[w]["day"].append(np.full(len(keep), origin_day))
+        if reference is None:
+            reference = {name: result[name][keep] for name in ("wid", "segment", "origin", "target")}
+        else:  # the same wallet-origin has the same segment, origin state and realised next state under every W
+            for name in ("wid", "segment", "origin", "target"):
+                assert np.array_equal(reference[name], result[name][keep]), f"W={w}: the common evaluation set is not aligned ({name})."
+aligned = {w: {name: np.concatenate(parts) for name, parts in arrays.items()} for w, arrays in aligned.items()}
+n_common = len(aligned[WINDOW_GRID[0]]["wid"])
+print(f"Common evaluation transitions (all origins, all segments): {n_common:,}")
+print("Evaluation transitions left out because another W drops the wallet (per W):", {w: n_all[w] - n_common for w in WINDOW_GRID})
+
+# Per-wallet sums by segment (a wallet can be A at one origin and B at another, so the segment is kept).
+wallet_ids, wallet_index = np.unique(aligned[WINDOW_GRID[0]]["wid"], return_inverse=True)
+n_wallets_eval = len(wallet_ids)
+cell = wallet_index * N_SEGMENTS + aligned[WINDOW_GRID[0]]["segment"]
+cell_size = n_wallets_eval * N_SEGMENTS
+
+
+def wallet_segment_sums(values: np.ndarray | None) -> np.ndarray:
+    """Sum of ``values`` (or count if None) by wallet and segment, shape (wallets, segments)."""
+    return np.bincount(cell, weights=values, minlength=cell_size).reshape(n_wallets_eval, N_SEGMENTS)
+
+
+count_by_wallet = wallet_segment_sums(None)
+log_by_wallet = {w: wallet_segment_sums(aligned[w]["log_score"]) for w in WINDOW_GRID}
+brier_by_wallet = {w: wallet_segment_sums(aligned[w]["brier"]) for w in WINDOW_GRID}
+
+# Wallet bootstrap: one weight vector per replicate, shared by every W (paired differences).
+rng = np.random.default_rng(SELECTION_SEED)
+boot_weights = rng.multinomial(n_wallets_eval, np.full(n_wallets_eval, 1.0 / n_wallets_eval), size=N_BOOTSTRAP_SELECTION).astype(np.float64)
+boot_count = boot_weights @ count_by_wallet  # (B, segments)
+
+
+def scores_from_sums(sums: np.ndarray, counts: np.ndarray) -> tuple[float, np.ndarray]:
+    """Total mean score and mean score by segment from the (segments,) sums and counts."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return float(sums.sum() / counts.sum()), sums / counts
+
+
+point = {}
+boot_total, boot_segment = {}, {}
+for w in WINDOW_GRID:
+    total_log, segment_log = scores_from_sums(log_by_wallet[w].sum(axis=0), count_by_wallet.sum(axis=0))
+    total_brier, segment_brier = scores_from_sums(brier_by_wallet[w].sum(axis=0), count_by_wallet.sum(axis=0))
+    point[w] = {"log": total_log, "brier": total_brier, "log_segment": segment_log, "brier_segment": segment_brier}
+    boot_log_sums = boot_weights @ log_by_wallet[w]
+    boot_brier_sums = boot_weights @ brier_by_wallet[w]
+    boot_total[w] = {"log": boot_log_sums.sum(axis=1) / boot_count.sum(axis=1), "brier": boot_brier_sums.sum(axis=1) / boot_count.sum(axis=1)}
+    with np.errstate(invalid="ignore", divide="ignore"):
+        boot_segment[w] = boot_log_sums / boot_count
+
+best_window = max(WINDOW_GRID, key=lambda w: point[w]["log"])
+best_brier_window = min(WINDOW_GRID, key=lambda w: point[w]["brier"])
+selection_rows = []
+for w in WINDOW_GRID:
+    diff_boot = boot_total[best_window]["log"] - boot_total[w]["log"]
+    diff_point = point[best_window]["log"] - point[w]["log"]
+    se_diff = float(np.std(diff_boot, ddof=1)) if w != best_window else 0.0
+    selection_rows.append(
+        {
+            "W": w,
+            "n_eval": n_common,
+            "mean_log_score": point[w]["log"],
+            "se_log_score": float(np.std(boot_total[w]["log"], ddof=1)),
+            "diff_vs_best": diff_point,
+            "se_diff_paired": se_diff,
+            "within_1se": bool(diff_point <= se_diff) if w != best_window else True,
+            "mean_brier": point[w]["brier"],
+            "brier_diff_vs_best": point[w]["brier"] - point[best_brier_window]["brier"],
+        }
+    )
+selection_table = pd.DataFrame(selection_rows).set_index("W")
+SELECTED_WINDOW = int(selection_table.index[selection_table["within_1se"]].max())
+
+segment_log_table = pd.DataFrame({SEGMENT_NAMES[k]: [point[w]["log_segment"][k] for w in WINDOW_GRID] for k in range(N_SEGMENTS)}, index=pd.Index(WINDOW_GRID, name="W"))
+segment_se_table = pd.DataFrame(
+    {SEGMENT_NAMES[k]: [float(np.nanstd(boot_segment[w][:, k], ddof=1)) for w in WINDOW_GRID] for k in range(N_SEGMENTS)},
+    index=pd.Index(WINDOW_GRID, name="W"),
+)
+segment_n = pd.Series(count_by_wallet.sum(axis=0).astype(int), index=SEGMENT_NAMES, name="n_eval")
+
+print(f"Out-of-sample log score by window length W (origins t-30 ... t-1, B={N_BOOTSTRAP_SELECTION} wallet-bootstrap replicates, paired):")
+display(selection_table.round(5))
+print(f"Best total log score: W = {best_window}. Best Brier score: W = {best_brier_window}.")
+print(f"Selected by the 1-SE rule (longest W within one paired SE of the best): W* = {SELECTED_WINDOW}")
+print("\nDiagnostic: mean log score by scenario and profile (each segment with its own P_hat):")
+display(segment_log_table.round(5))
+print("Evaluation transitions by segment:")
+display(segment_n.to_frame().T)
+if IS_SAMPLE_RUN:
+    print("\nSAMPLE RUN: the sample is stratified (liquidated and repaid wallets are over-represented), so W* above is not an estimate.")
+
+# %%
+fig, axes = plt.subplots(1, 3, figsize=(18, 4.8))
+ax = axes[0]
+ax.errorbar(WINDOW_GRID, selection_table["mean_log_score"], yerr=selection_table["se_log_score"], fmt="o-", color="#4C72B0", capsize=3)
+ax.axvline(SELECTED_WINDOW, color="#C44E52", linestyle="--", label=f"W* = {SELECTED_WINDOW}")
+ax.scatter([best_window], [point[best_window]["log"]], s=140, facecolors="none", edgecolors="black", label=f"best W = {best_window}")
+ax.set_xlabel("Window length W (days)")
+ax.set_ylabel("Mean log score (total, higher is better)")
+ax.set_title("Total log score (bars: unpaired bootstrap SE)")
+ax.legend()
+
+ax = axes[1]
+ax.errorbar(
+    WINDOW_GRID, selection_table["diff_vs_best"], yerr=selection_table["se_diff_paired"], fmt="o-", color="#55A868", capsize=3
+)
+ax.plot(WINDOW_GRID, selection_table["se_diff_paired"], color="#C44E52", linestyle=":", label="1 paired SE (rule threshold)")
+ax.axvline(SELECTED_WINDOW, color="#C44E52", linestyle="--")
+ax.set_xlabel("Window length W (days)")
+ax.set_ylabel("Log score of the best W minus log score of W")
+ax.set_title("Loss against the best W (paired, bars: paired SE)")
+ax.legend()
+
+ax = axes[2]
+ax.plot(WINDOW_GRID, selection_table["mean_brier"], "o-", color="#8172B2")
+ax.axvline(SELECTED_WINDOW, color="#C44E52", linestyle="--")
+ax.set_xlabel("Window length W (days)")
+ax.set_ylabel("Mean multi-class Brier score (lower is better)")
+ax.set_title("Secondary metric: Brier score")
+plt.tight_layout()
+plt.show()
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 9), sharex=True)
+for k, ax in enumerate(axes.ravel()):
+    ax.errorbar(WINDOW_GRID, segment_log_table[SEGMENT_NAMES[k]], yerr=segment_se_table[SEGMENT_NAMES[k]], fmt="o-", capsize=3, color="#4C72B0")
+    ax.axvline(SELECTED_WINDOW, color="#C44E52", linestyle="--", label=f"W* = {SELECTED_WINDOW}")
+    ax.set_title(f"{SEGMENT_NAMES[k]}  (n = {int(segment_n.iloc[k]):,})")
+    ax.set_xlabel("Window length W (days)")
+    ax.set_ylabel("Mean log score")
+    ax.legend()
+fig.suptitle("Diagnostic: mean log score by scenario and profile (bars: unpaired bootstrap SE; the rule uses the total)", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# ### 12.3 Impact of the selected window on the PD
+#
+# The 30-day PD by origin state is recomputed with the calibration window $[t-W^*, t]$ and compared with the production window $W = 30$, for each scenario and profile. Both use the same chain rules and the raw empirical $\hat{\mathbf{P}}$ of Section 10 (no pseudo-count), through `window_transitions` with the labels taken on the whole window; with $W = 30$ it reproduces the production $\mathbf{N}$ exactly (checked below). The second table shows the PD for every length of the grid, anchored at $t$.
+#
+# **What this is and is not.** `CALIBRATION_DAYS` stays 30 for the production tables and the exports until the author and the tutor decide. The extra 30 days of history are used only to select $W^*$. The criterion of Section 12.2 is one day ahead; whether the 30-day projection improves with a shorter or longer window is assessed by the out-of-time backtest, not here. When $W^* = 30$ the table shows no change.
+
+# %%
+def anchored_window_matrices(window_length: int) -> dict[tuple[str, str], tuple[pd.DataFrame, pd.DataFrame]]:
+    """Count and probability matrices of every segment for the calibration window [t - W, t] (production rules)."""
+    transitions = window_transitions(T_IDX - window_length, T_IDX, T_IDX)
+    return {
+        (scenario_label, profile): build_empirical_transition_matrices(subset_transitions(transitions, scenario_key, profile))
+        for scenario_key, scenario_label in SCENARIO_KEYS
+        for profile in PROFILE_KEYS
+    }
+
+
+production_check = anchored_window_matrices(CALIBRATION_DAYS)
+for key, (counts_check, p_check) in production_check.items():
+    assert np.array_equal(counts_check.to_numpy(), empirical_N[key].to_numpy()), f"{key}: window_transitions does not reproduce the production N."
+    assert np.abs(p_check.to_numpy() - empirical_P[key].to_numpy()).max() < 1e-12, f"{key}: window_transitions does not reproduce the production P."
+print(f"Check passed: the window machinery with W = {CALIBRATION_DAYS} reproduces the production N and P of the four segments.")
+
+anchored = {w: (production_check if w == CALIBRATION_DAYS else anchored_window_matrices(w)) for w in sorted(set(WINDOW_GRID) | {SELECTED_WINDOW, CALIBRATION_DAYS})}
+
+impact_records = []
+for scenario_key, scenario_label in SCENARIO_KEYS:
+    for profile in PROFILE_KEYS:
+        key = (scenario_label, profile)
+        counts_star, p_star = anchored[SELECTED_WINDOW][key]
+        counts_ref, p_ref = anchored[CALIBRATION_DAYS][key]
+        pd_star, pd_ref = horizon_pd(p_star), horizon_pd(p_ref)
+        for state in TRANSIENT_STATES:
+            n_star, n_ref = int(counts_star.loc[state].sum()), int(counts_ref.loc[state].sum())
+            value_star = pd_star[state] if n_star > 0 else np.nan
+            value_ref = pd_ref[state] if n_ref > 0 else np.nan
+            impact_records.append(
+                {
+                    "scenario": scenario_label,
+                    "profile": profile,
+                    "current_state": state,
+                    f"n_W{SELECTED_WINDOW}": n_star,
+                    f"pd30_W{SELECTED_WINDOW}": value_star,
+                    f"n_W{CALIBRATION_DAYS}": n_ref,
+                    f"pd30_W{CALIBRATION_DAYS}": value_ref,
+                    "abs_diff": value_star - value_ref,
+                    "rel_diff": (value_star - value_ref) / value_ref if value_ref and np.isfinite(value_ref) else np.nan,
+                }
+            )
+window_impact = pd.DataFrame(impact_records).set_index(["scenario", "profile", "current_state"])
+print(f"{HORIZON_DAYS}-day PD by origin state: W* = {SELECTED_WINDOW} versus the production window W = {CALIBRATION_DAYS} (point estimates, raw empirical P)")
+display(window_impact.round(5))
+
+grid_records = []
+for w in sorted(anchored):
+    for (scenario_label, profile), (counts_w, p_w) in anchored[w].items():
+        pd_w = horizon_pd(p_w)
+        for state in TRANSIENT_STATES:
+            grid_records.append(
+                {
+                    "scenario": scenario_label,
+                    "profile": profile,
+                    "current_state": state,
+                    "W": w,
+                    "pd30": pd_w[state] if counts_w.loc[state].sum() > 0 else np.nan,
+                }
+            )
+pd_by_window = pd.DataFrame(grid_records).pivot_table(index=["scenario", "profile", "current_state"], columns="W", values="pd30", dropna=False)
+print(f"{HORIZON_DAYS}-day PD by origin state for every candidate length, window [t-W, t]:")
+display(pd_by_window.round(5))
 
 # %% [markdown]
 # ## 13. Threshold sensitivity analysis
@@ -2058,7 +2559,7 @@ display(portfolio_sensitivity.round(6))
 # The base panel keeps user-days with at least USD 100 of debt (`MIN_DEBT_USD`). This check re-runs the **same functions** (`qualifying_panel`, `drop_hybrid_wallets`, `run_chain`) with a USD 1,000 minimum, so purity, `S1` detection and censoring are recomputed under the stricter filter, and compares the transition counts $N$ and the 30-day PD by origin state. It is a compact comparison, not a second full pipeline. A higher minimum removes the small positions that liquidators ignore; if the PD of the larger positions differs markedly from the base, the choice of minimum debt matters for the thesis.
 
 # %%
-panel_sensitivity, _ = drop_hybrid_wallets(qualifying_panel(user_day, MIN_DEBT_SENSITIVITY_USD))
+panel_sensitivity, _ = drop_hybrid_wallets(production_window(qualifying_panel(user_day, MIN_DEBT_SENSITIVITY_USD)))
 panel_sensitivity = panel_sensitivity.loc[panel_sensitivity["day"] <= T_IDX].reset_index(drop=True)
 panel_sensitivity["state_hf"] = map_health_factor_to_state(panel_sensitivity["health_factor"])
 chain_sensitivity = run_chain(panel_sensitivity)
@@ -2202,7 +2703,7 @@ def oot_outcomes(trajectories: dict[str, pd.DataFrame], valuation: pd.DataFrame)
 
 def to_date_string(scenario: pd.Series, day: pd.Series) -> pd.Series:
     """Calendar date (YYYY-MM-DD) of a day index; NaN stays empty."""
-    dates = scenario.map(DAY1_DATE) + pd.to_timedelta(day, unit="D")
+    dates = scenario.map(DAY0_DATE) + pd.to_timedelta(day, unit="D")
     return dates.dt.strftime(DATE_FORMAT)
 
 
@@ -2216,7 +2717,7 @@ def build_wallet_cohorts_table(chain_result: dict) -> pd.DataFrame:
     ]  # fmt: skip
     late = summary["is_late_entrant"]
 
-    day1 = obs.loc[obs["day"] == 0, base_columns].copy()
+    day1 = obs.loc[obs["day"] == CAL_START_IDX, base_columns].copy()
     day1["cohort"] = "day1"
     day1 = day1.join(summary[["final_state", "event_day", "exit_reason", "landing", "type"]], on="sid")
     day1["is_late_entrant"] = False
@@ -2342,7 +2843,7 @@ for scenario_key, scenario_label in SCENARIO_KEYS:
         assert gap <= ROUND_TRIP_TOLERANCE, f"{scenario_label} | {profile}: round-trip gap {gap:.2e}."
 
 exit_memory = (
-    wallet_summary.loc[wallet_summary["first_day"] == 0]
+    wallet_summary.loc[wallet_summary["first_day"] == CAL_START_IDX]
     .assign(scenario=lambda frame: frame["scenario"].map(SCENARIO_LABEL))
     .groupby(["scenario", "profile", "exit_reason"])
     .size()
@@ -2386,7 +2887,8 @@ display(
 # - **Panel and trajectories (Parts B-C).** The pure A and B wallets of each scenario, their daily states and the exit reason of every spell (`S1_repay`, `S7_hf`, `S7_liquidation_call`, `censored_filter_exit`, `censored_window_end`). Sections 9 and 9.1 report the sample sizes, the informative-censoring check and the `S7` outcomes that $\mathbf{N}$ does not see.
 # - **Matrices (Section 10).** Four daily matrices $\mathbf{P}$ (baseline and stress, profiles A and B) with their count matrices $\mathbf{N}$. The `S1` and `S7` rows are the identity by definition; an origin state with fewer than `MIN_ROW_DEPTH` transitions is flagged as thin, and one without transitions has no estimate.
 # - **PD (Section 11).** $\text{PD}_i = [\mathbf{P}^{30}]_{i,S7}$ by origin state with the 95% wallet-bootstrap interval. Read the thin rows together with their interval.
-# - **Robustness (Part E).** The time-homogeneity test (Section 12) is provisional and will be replaced. Section 13 shows how the PD moves when the intermediate cut points are shifted by $\pm 0.05$ and Section 14 when the minimum debt rises to USD 1,000: they tell whether those choices matter for the thesis.
+# - **Calibration window (Section 12).** The sub-window comparison (days 1-15 versus 16-30, and rolling 10-day windows) shows whether the PD by state moves inside the 30-day window. The out-of-sample selection compares the window lengths of `WINDOW_GRID` by the one-day-ahead log score over the origins $t-30, \dots, t-1$ and applies the 1-SE rule to pick one $W^*$; Section 12.3 shows its impact on the PD. `CALIBRATION_DAYS` stays 30 until the author and the tutor decide, and the 30 extra days of history are used only for this selection.
+# - **Robustness (Part E).** Section 13 shows how the PD moves when the intermediate cut points are shifted by $\pm 0.05$ and Section 14 when the minimum debt rises to USD 1,000: they tell whether those choices matter for the thesis.
 # - **Exports (Section 15).** `markov_segment_params_not_for_prod.csv` and `markov_wallet_cohorts_not_for_prod.csv`, checked by an exact round trip. A sample run writes under `data/sample/02_interim/` and its figures are not estimates (the sample is stratified, not representative).
 #
 # Open points: the out-of-time backtest uses the `oot_*` columns of the cohort export; the `S7` outcomes without an entry transition (Section 9.1) should be reported apart in the in-sample backtest.
