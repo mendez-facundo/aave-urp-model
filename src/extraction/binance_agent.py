@@ -56,12 +56,7 @@ SCENARIOS: list[tuple[str, Path]] = [
     ("2024-03-15", BASELINE_DIR),
     ("2024-08-05", STRESS_DIR),
 ]
-ASSETS: list[tuple[str, str]] = [
-    ("ETHUSDT", "binance_prices_eth.csv"),
-    ("UNIUSDT", "binance_prices_uni.csv"),
-    ("BTCUSDT", "binance_prices_btc.csv"),
-    ("LINKUSDT", "binance_prices_link.csv"),
-]
+ASSETS: list[str] = ["ETHUSDT", "UNIUSDT", "BTCUSDT", "LINKUSDT"]
 
 
 class BinanceAPIError(RuntimeError):
@@ -287,10 +282,9 @@ def run_extraction() -> None:
 
     for end_date, output_dir in SCENARIOS:
         prices_by_ticker: dict[str, pd.DataFrame] = {}
-        for asset, filename in ASSETS:
+        for asset in ASSETS:
             try:
                 prices = download_historical_prices(asset=asset, end_date=end_date)
-                save_prices_csv(prices, output_dir / filename)
                 prices_by_ticker[asset] = prices
             except (BinanceAPIError, ValueError, requests.RequestException) as exc:
                 logger.error(

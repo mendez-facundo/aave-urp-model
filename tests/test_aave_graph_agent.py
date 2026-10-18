@@ -2,7 +2,7 @@
 
 The HTTP session is replaced by a fake and ``time.sleep`` is disabled, so the
 checks run in well under a second and never touch data/.
-Run from the repository root with: venv/Scripts/python.exe scripts/tests/test_aave_graph_agent.py
+Run from the repository root with: venv/Scripts/python.exe tests/test_aave_graph_agent.py
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
