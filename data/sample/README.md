@@ -1,6 +1,6 @@
 # Development sample
 
-Small, reproducible subset of `data/01_raw/` for developing and testing the pipeline. All 61 days of each scenario window are kept; only the users are subsampled. Git-ignored (only `.gitkeep` is tracked). Full runs use the raw data.
+Small, reproducible subset of `data/01_raw/` for developing and testing the pipeline. All 91 days of each scenario window are kept; only the users are subsampled. Git-ignored (only `.gitkeep` is tracked). Full runs use the raw data.
 
 ## How it was built
 
@@ -21,15 +21,15 @@ Positions and events are filtered by user with a byte-exact line copy (same colu
 
 | scenario | users | liquidated | repay_to_zero | profile_ab | borrower | position rows | liquidation events | repay events | users/day (min-max) | ever A | ever B |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| baseline_mar2024 | 300 | 100 | 80 | 120 | 0 | 35086 | 193 | 641 | 209-229 | 235 | 67 |
-| stress_aug2024 | 300 | 100 | 80 | 120 | 0 | 33466 | 218 | 625 | 211-237 | 246 | 55 |
+| baseline_mar2024 | 300 | 100 | 80 | 120 | 0 | 45578 | 151 | 614 | 179-211 | 242 | 62 |
+| stress_aug2024 | 300 | 100 | 80 | 120 | 0 | 48887 | 272 | 837 | 193-223 | 243 | 58 |
 
 Candidate pools in the full raw data:
 
 | scenario | liquidated users in positions | repay-to-zero users | ever A (not B) | ever B | all borrowers |
 |---|---|---|---|---|---|
-| baseline_mar2024 | 313 | 1730 | 4673 | 469 | 10296 |
-| stress_aug2024 | 1325 | 1951 | 6957 | 544 | 15267 |
+| baseline_mar2024 | 350 | 2322 | 4995 | 498 | 10810 |
+| stress_aug2024 | 1460 | 2679 | 7345 | 599 | 15958 |
 
 ## Caveats
 
