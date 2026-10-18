@@ -35,7 +35,7 @@
 # 4. **Base panel:** users-days with total debt $\ge$ USD 100 (`min_debt_usd = 100`).
 # 5. **Profiles:** A ($\ge 85\%$ ETH/LST collateral) and B ($\ge 85\%$ UNI + LINK), stablecoin debt only.
 # 6. **Valuation cohort** = wallets observed at $t$ (EAD = their total debt at $t$). **In-sample backtest cohort** = wallets observed on day $t-30$, without late entrants.
-# 7. **LGD side (Part 2):** shocks are per asset, weighted by each wallet's collateral composition, with **comonotonic** dependence (all assets fall at once by their own expected shortfall); stablecoin collateral is not shocked (parity), LSTs take the ETH shock; the LGD is conditional on the liquidation event and is a 1-day quantity (the 30-day path to the trigger is already inside the PD).
+# 7. **LGD side (Part 2):** shocks are per asset, weighted by each wallet's collateral composition, with **comonotonic** dependence (all assets fall at once by their own expected shortfall); stablecoin collateral is not shocked (parity), LSTs take the ETH shock; the LGD is conditional on the liquidation event and is a 1-day quantity (the 30-day path to the trigger is already inside the PD). The loss is measured in units of the **debt stablecoin**, whose parity is kept in the base variants; Section 6.1 and the variants `S_depeg_debt_*` add a sensitivity to a move of that stablecoin between the trigger and the liquidation.
 
 # %% [markdown]
 # ## 1. Load and validate the inputs
@@ -626,7 +626,8 @@ plt.show()
 # | **V2** "empirical HF at entry (gap risk)" | V1 averaged over the empirical distribution of $HF_{entry}$ of the `S7` entries of the same scenario $\times$ profile calibration window |
 # | **V3** / **V3b** | V1 with ES 99.5% / ES 99.9% (1 day); 99.9% is **out of sample** for the 730-day window |
 # | **V4** ($h = 3$, $h = 5$) | V1 with the ES 99% of an $h$-day loss (Monte Carlo rows of notebook 03) |
-# | **S-depeg** | V1 with the stablecoin part of the collateral valued at 0.88 (USDC low of March 2023) |
+# | **S-depeg** | V1 with the stablecoin part of the **collateral** valued at 0.88 (USDC low of March 2023) |
+# | **S-depeg-debt** (`S_depeg_debt_up05`, `_up1`, `_up2`, `_down12`) | V1 with a move $u$ of the **debt** stablecoin (relative to USD) between the trigger and the liquidation, so that the collateral retention in debt units becomes $\text{retention}/(1+u)$: $u = +0.5\%,\ +1\%,\ +2\%$ (the debt stablecoin appreciates: an extra collateral shock) and $u = -12\%$ (the March 2023 low of USDC/DAI, in the direction that *reduces* the loss) |
 #
 # **Why V1 conditions on the liquidation event.** If the position is liquidated when $HF = 1$, then $C/D = HF_{entry}/LT_w$. A liquidation repays debt $x$ and seizes $x(1+LB)$ of collateral, which improves $C/D$ if $C/D > 1+LB$ and worsens it if $C/D < 1+LB$; the threshold does not depend on whether the liquidation is partial or total. The 1-day ES shock hits the collateral between the trigger and the liquidation. With the 30-day PD this is coherent: the PD already contains the price path up to the trigger, and a 30-day shock in the LGD would count it twice.
 #
@@ -637,7 +638,7 @@ plt.show()
 #
 # ### 6.1 Shocks and break-even table
 #
-# The shocks are the ES **price** shocks ($1 - e^{-L}$ conditioned on the tail, `es_price_shock`) of notebook 03. Variants V1, V1nb, V2 and S-depeg use ES 99% at one day (the closed-form row, checked against the notebook-03 base export); V3 uses 99.5% and V3b 99.9% (closed form, one day); V4 uses the Monte Carlo rows of $h = 3$ and $h = 5$ days at 99%. The break-even table gives, for a wallet entirely in one asset, the shock at which a liquidation at $HF_{entry}=1$ starts to lose money: $1 - LT$ without bonus and $1 - LT(1+LB)$ with bonus. If the ES is below the break-even shock the LGD of that asset is exactly 0.
+# The shocks are the ES **price** shocks ($1 - e^{-L}$ conditioned on the tail, `es_price_shock`) of notebook 03. Variants V1, V1nb, V2, S-depeg and the four S-depeg-debt variants use ES 99% at one day (the closed-form row, checked against the notebook-03 base export); V3 uses 99.5% and V3b 99.9% (closed form, one day); V4 uses the Monte Carlo rows of $h = 3$ and $h = 5$ days at 99%. The break-even table gives, for a wallet entirely in one asset, the shock at which a liquidation at $HF_{entry}=1$ starts to lose money: $1 - LT$ without bonus and $1 - LT(1+LB)$ with bonus. If the ES is below the break-even shock the LGD of that asset is exactly 0. The last table of this section gives the equivalent break-even for a move of the debt stablecoin.
 
 # %%
 GROUP_ASSET = {"eth_core_usd": "ETH", "wbtc_usd": "BTC", "uni_usd": "UNI", "link_usd": "LINK", "stable_usd": None}
@@ -716,9 +717,56 @@ print("\nBreak-even shocks (Aave LT/LB) versus the ES shocks: LGD > 0 at HF_entr
 display(breakeven_check.set_index(["scenario", "aave_symbol"]).drop(columns=["asset"]).round(4))
 
 # %% [markdown]
+# #### Debt-side stablecoin move: channel and break-even debt move $u^*$
+#
+# **Units.** The loss is measured in units of the *debt* stablecoin (the currency of the Deficit Buffer), and the base variants keep that stablecoin at parity. Two facts support it. (i) The EVT shocks of notebook 03 come from ETHUSDT and the other Binance `*USDT` pairs, so they are already price changes in USDT units and nothing is converted to USD. (ii) On the Health Factor side (notebook 02) stablecoins and LSTs are valued at their **Aave oracle price**, which stayed close to 1: the observed USDC/USDT/DAI oracle range is 0.9988-1.0024 in the baseline window and 0.9992-1.0009 in the stress window.
+#
+# **Channel.** Let the debt stablecoin move by $u$ relative to USD between the liquidation trigger and the liquidation. The debt is fixed in units of that stablecoin, so its USD value is multiplied by $(1+u)$ while the collateral keeps its post-shock USD value: the collateral retention in debt units becomes $\text{retention}/(1+u)$ and
+#
+# $$\mathrm{LGD}_w(u) = \max\!\Big(0,\ 1 - \tfrac{HF_{entry}}{LT_w}\,\tfrac{\sum_k s_k (1-\text{shock}_k)}{(1+LB_w)\,(1+u)}\Big).$$
+#
+# An **upward** move ($u>0$) acts like an extra collateral shock (the stablecoin to be repaid became more expensive). A **downward** move ($u<0$; the historical case is USDC/DAI near 0.88 in March 2023) makes the debt cheaper in USD and **reduces** the loss. The EVT shocks themselves are not touched: $u$ is a separate, exploratory stress added on top of them, applied through `debt_move` in `lgd_at_entry`.
+#
+# **Why the debt side and not the collateral side.** The collateral-side de-peg `S_depeg` (stablecoin collateral valued at 0.88) is immaterial because stablecoins are only a tiny part of the collateral of these portfolios (the aggregate share is printed below, roughly 0.03%-0.16% depending on the segment), whereas the *whole* debt is a stablecoin.
+#
+# **Break-even debt move.** For a wallet entirely in one asset, V1 turns positive when $(1-\text{shock})/(1+u^*) = LT\,(1+LB)$, that is
+#
+# $$u^* = \frac{1-\text{shock}}{LT\,(1+LB)} - 1 .$$
+#
+# V1 is positive for $u > u^*$. A **negative** $u^*$ means V1 is already positive without any move of the debt stablecoin (the ES shock exceeds the break-even shock with bonus); a positive $u^*$ is the appreciation of the debt stablecoin that the liquidation bonus and the LT margin can absorb before the first loss. The table shows $u^*$ at ES 99% ($h = 1$) for each collateral symbol and scenario, and which of the four debt moves of the variants makes the single-asset V1 positive.
+
+# %%
+DEBT_MOVES = {  # variant -> move u of the debt stablecoin relative to USD between trigger and liquidation
+    "S_depeg_debt_up05": 0.005,
+    "S_depeg_debt_up1": 0.01,
+    "S_depeg_debt_up2": 0.02,
+    "S_depeg_debt_down12": -0.12,
+}
+assert all(move > -1.0 for move in DEBT_MOVES.values()), "A debt move of -100% or lower is not defined."
+
+debt_breakeven = breakeven[["scenario", "aave_symbol", "lt", "lb"]].copy()
+debt_breakeven["ES99 h=1 shock"] = [asset_shocks(s, "ES99_h1")[a] for s, a in zip(breakeven["scenario"], breakeven["asset"])]
+debt_breakeven["u* (%)"] = 100 * ((1.0 - debt_breakeven["ES99 h=1 shock"]) / (debt_breakeven["lt"] * (1.0 + debt_breakeven["lb"])) - 1.0)
+# u* < 0 exactly when the ES99 shock exceeds the break-even shock with bonus (same condition, other unit)
+assert ((debt_breakeven["u* (%)"] < 0) == (debt_breakeven["ES99 h=1 shock"] > breakeven["breakeven_with_bonus"])).all()
+for variant, move in DEBT_MOVES.items():
+    debt_breakeven[f"{variant}: LGD > 0"] = (100 * move) > debt_breakeven["u* (%)"]
+print("Break-even debt move u* at ES99 (h = 1): V1 of a single-asset wallet is positive for u > u* (negative u* = V1 already positive):")
+display(
+    debt_breakeven.set_index(["scenario", "aave_symbol"]).style.format(
+        {"lt": "{:.2f}", "lb": "{:.2f}", "ES99 h=1 shock": "{:.4f}", "u* (%)": "{:+.3f}"}
+    )
+)
+
+stable_share = valuation.groupby(["scenario", "profile"])[["stable_usd", "total_collateral_usd"]].sum()
+stable_share = (100 * stable_share["stable_usd"] / stable_share["total_collateral_usd"]).rename("stablecoin share of the collateral (%)")
+print("\nStablecoin share of the collateral of the valuation cohort (why the collateral-side de-peg S_depeg is immaterial):")
+display(stable_share.to_frame().style.format("{:.3f}"))
+
+# %% [markdown]
 # ### 6.2 LGD functions, with unit checks
 #
-# `lgd_current_position` is V0; `lgd_at_entry` is V1 (and V1nb, V3, V4, S-depeg through the shock vector, the bonus switch and the stable shock); `lgd_empirical_entry` is V2. All return values in $[0, 1]$. The unit checks tie the code to the break-even table: for a synthetic wallet entirely in one asset, $\mathrm{LGD}_{V1} > 0$ exactly when the ES shock exceeds `breakeven_with_bonus` (and V1nb exactly when it exceeds `breakeven_no_bonus`).
+# `lgd_current_position` is V0; `lgd_at_entry` is V1 (and V1nb, V3, V4, S-depeg through the shock vector, the bonus switch and the stable shock, and the S-depeg-debt variants through `debt_move`, whose default 0 leaves every other variant unchanged); `lgd_empirical_entry` is V2. All return values in $[0, 1]$. The unit checks tie the code to the break-even table: for a synthetic wallet entirely in one asset, $\mathrm{LGD}_{V1} > 0$ exactly when the ES shock exceeds `breakeven_with_bonus` (and V1nb exactly when it exceeds `breakeven_no_bonus`), and, for the debt move, exactly when $u$ exceeds the break-even debt move $u^*$ of Section 6.1.
 
 # %%
 def collateral_retention(frame: pd.DataFrame, shock_vectors: dict[str, np.ndarray]) -> np.ndarray:
@@ -733,9 +781,16 @@ def lgd_current_position(collateral: np.ndarray, debt: np.ndarray, retention: np
     return np.maximum(0.0, 1.0 - (collateral / debt) * retention)
 
 
-def lgd_at_entry(hf_entry: np.ndarray, lt_w: np.ndarray, lb_w: np.ndarray, retention: np.ndarray, bonus: bool = True) -> np.ndarray:
-    """V1: max(0, 1 - (HF_entry / LT_w) * retention / (1 + LB_w)); ``bonus=False`` drops the (1 + LB_w) factor."""
-    return np.maximum(0.0, 1.0 - (hf_entry / lt_w) * retention / ((1.0 + lb_w) if bonus else 1.0))
+def lgd_at_entry(
+    hf_entry: np.ndarray, lt_w: np.ndarray, lb_w: np.ndarray, retention: np.ndarray, bonus: bool = True, debt_move: float = 0.0
+) -> np.ndarray:
+    """V1: max(0, 1 - (HF_entry / LT_w) * retention / (1 + LB_w)); ``bonus=False`` drops the (1 + LB_w) factor.
+
+    ``debt_move`` is the move u of the debt stablecoin relative to USD between trigger and liquidation: the
+    retention in debt units becomes retention / (1 + u). The default 0 leaves the result unchanged.
+    """
+    assert debt_move > -1.0, "debt_move must be above -100%."
+    return np.maximum(0.0, 1.0 - (hf_entry / lt_w) * retention / (((1.0 + lb_w) if bonus else 1.0) * (1.0 + debt_move)))
 
 
 def lgd_empirical_entry(entry_pool: np.ndarray, lt_w: np.ndarray, lb_w: np.ndarray, retention: np.ndarray) -> np.ndarray:
@@ -756,6 +811,20 @@ for _, row in breakeven.iterrows():
     assert abs(lgd_bonus - max(0.0, 1.0 - (1.0 / row["lt"]) * (1.0 - shock) / (1.0 + row["lb"]))) < 1e-15
     unit_rows.append({"scenario": row["scenario"], "asset": row["aave_symbol"], "ES99 shock": shock, "LGD V1": lgd_bonus, "LGD V1nb": lgd_no_bonus})
 print("Unit checks passed: LGD V1 > 0 iff ES99 > break-even with bonus; V1nb > 0 iff ES99 > break-even without bonus; V1 >= V1nb.")
+
+# debt move: default 0 changes nothing, the LGD is zero just below u* and positive just above it, and it is increasing in u
+for _, row in debt_breakeven.iterrows():
+    args = (np.array([1.0]), np.array([row["lt"]]), np.array([row["lb"]]), np.array([1.0 - row["ES99 h=1 shock"]]))
+    u_star = row["u* (%)"] / 100
+    assert np.array_equal(lgd_at_entry(*args, debt_move=0.0), lgd_at_entry(*args)), "debt_move = 0 must not change the LGD."
+    assert lgd_at_entry(*args, debt_move=u_star - 1e-6)[0] == 0.0, f"{row['scenario']}/{row['aave_symbol']}: LGD > 0 below u*."
+    assert lgd_at_entry(*args, debt_move=u_star + 1e-6)[0] > 0.0, f"{row['scenario']}/{row['aave_symbol']}: LGD = 0 above u*."
+    assert abs(lgd_at_entry(*args, debt_move=u_star)[0]) < 1e-12, f"{row['scenario']}/{row['aave_symbol']}: LGD(u*) != 0."
+    grid = [lgd_at_entry(*args, debt_move=u)[0] for u in sorted(DEBT_MOVES.values())]
+    assert all(a <= b + 1e-15 for a, b in zip(grid, grid[1:])), "The LGD must not decrease with the debt move."
+    for variant, move in DEBT_MOVES.items():
+        assert (lgd_at_entry(*args, debt_move=move)[0] > 0) == bool(row[f"{variant}: LGD > 0"]), f"{variant}: sign mismatch with u*."
+print("Unit checks passed: debt_move = 0 is the identity; single-asset V1 is 0 below u* and > 0 above it; LGD is non-decreasing in the debt move.")
 display(pd.DataFrame(unit_rows).set_index(["scenario", "asset"]).style.format("{:.4f}"))
 
 # %% [markdown]
@@ -857,10 +926,11 @@ display(share_same_interval.rename("share").to_frame().style.format("{:.1%}"))
 # %% [markdown]
 # ### 6.4 LGD of every wallet under every variant
 #
-# Wallets in `S2`-`S6` take $HF_{entry} = 1$ (V1-family) or the empirical sample (V2). Wallets already in `S7` at $t$ take their own entry, $HF_{entry} = \min(1, HF_{observed})$, in every variant of the V1 family (including V2: the entry has already happened, so no distribution is needed); V0 uses the current $C_w, D_w$ as for everybody. Assertions: $0 \le \mathrm{LGD}_w \le 1$ and no missing value. A memo after the assertions shows how fragile V2 is to the treatment of the wallets that were already in `S7` on day 1.
+# Wallets in `S2`-`S6` take $HF_{entry} = 1$ (V1-family) or the empirical sample (V2). Wallets already in `S7` at $t$ take their own entry, $HF_{entry} = \min(1, HF_{observed})$, in every variant of the V1 family (including V2: the entry has already happened, so no distribution is needed); V0 uses the current $C_w, D_w$ as for everybody. The four S-depeg-debt variants are V1 with $HF_{entry} = 1$, ES 99% ($h = 1$), the real $LT_w$ and $LB_w$ and only the debt move $u$ of Section 6.1 changed (`debt_move` in `lgd_at_entry`). Assertions: $0 \le \mathrm{LGD}_w \le 1$, no missing value, and for the debt moves $\mathrm{LGD}_{down12} \le \mathrm{LGD}_{V1} \le \mathrm{LGD}_{up05} \le \mathrm{LGD}_{up1} \le \mathrm{LGD}_{up2}$. A memo after the assertions shows how fragile V2 is to the treatment of the wallets that were already in `S7` on day 1.
 
 # %%
-VARIANT_ORDER = ["V0", "V1nb", "V1", "V2", "V3", "V3b", "V4_h3", "V4_h5", "S_depeg"]
+DEBT_VARIANTS = list(DEBT_MOVES)  # S_depeg_debt_up05, _up1, _up2, _down12 (order of DEBT_MOVES)
+VARIANT_ORDER = ["V0", "V1nb", "V1", "V2", "V3", "V3b", "V4_h3", "V4_h5", "S_depeg"] + DEBT_VARIANTS
 VARIANT_DESCRIPTION = {
     "V0": "original formula, current position, ES99 h=1, no bonus",
     "V1nb": "V1 without liquidation bonus",
@@ -871,7 +941,12 @@ VARIANT_DESCRIPTION = {
     "V4_h3": "V1 with ES99 of a 3-day loss (Monte Carlo)",
     "V4_h5": "V1 with ES99 of a 5-day loss (Monte Carlo)",
     "S_depeg": "V1 with stablecoin collateral valued at 0.88",
+    "S_depeg_debt_up05": "V1 with the debt stablecoin up 0.5% vs USD (retention / 1.005)",
+    "S_depeg_debt_up1": "V1 with the debt stablecoin up 1% vs USD (retention / 1.01)",
+    "S_depeg_debt_up2": "V1 with the debt stablecoin up 2% vs USD (retention / 1.02)",
+    "S_depeg_debt_down12": "V1 with the debt stablecoin down 12% vs USD (retention / 0.88; reduces the loss)",
 }
+assert set(VARIANT_DESCRIPTION) == set(VARIANT_ORDER) and len(set(VARIANT_ORDER)) == len(VARIANT_ORDER)
 display(pd.DataFrame({"variant": VARIANT_ORDER, "description": [VARIANT_DESCRIPTION[v] for v in VARIANT_ORDER]}).set_index("variant"))
 
 # ---- PD of every wallet --------------------------------------------------------------------------------
@@ -912,6 +987,8 @@ lgd["V3b"] = lgd_at_entry(hf_entry_v1, lt_w, lb_w, retention["ES999_h1"])
 lgd["V4_h3"] = lgd_at_entry(hf_entry_v1, lt_w, lb_w, retention["ES99_h3"])
 lgd["V4_h5"] = lgd_at_entry(hf_entry_v1, lt_w, lb_w, retention["ES99_h5"])
 lgd["S_depeg"] = lgd_at_entry(hf_entry_v1, lt_w, lb_w, retention["depeg"])
+for variant, move in DEBT_MOVES.items():
+    lgd[variant] = lgd_at_entry(hf_entry_v1, lt_w, lb_w, retention["ES99_h1"], debt_move=move)
 
 for variant in VARIANT_ORDER:
     values = lgd[variant]
@@ -923,7 +1000,13 @@ assert (lgd["V3"] >= lgd["V1"] - 1e-15).all() and (lgd["V3b"] >= lgd["V3"] - 1e-
 assert (lgd["V4_h5"] >= lgd["V4_h3"] - 1e-15).all() and (lgd["V4_h3"] >= lgd["V1"] - 1e-15).all()
 assert (lgd["S_depeg"] >= lgd["V1"] - 1e-15).all()
 assert (lgd["V2"] >= lgd["V1"] - 1e-15).all(), "HF_entry <= 1 in the pool: V2 cannot be below V1."
-print("LGD assertions passed for all variants: finite, 0 <= LGD <= 1, and the expected orderings V1nb <= V1 <= V2, V1 <= V3 <= V3b, V1 <= V4_h3 <= V4_h5, V1 <= S_depeg.")
+assert (lgd["S_depeg_debt_down12"] <= lgd["V1"] + 1e-15).all(), "A fall of the debt stablecoin must not increase the LGD."
+assert (lgd["V1"] <= lgd["S_depeg_debt_up05"] + 1e-15).all(), "A rise of the debt stablecoin must not reduce the LGD."
+assert (lgd["S_depeg_debt_up05"] <= lgd["S_depeg_debt_up1"] + 1e-15).all() and (lgd["S_depeg_debt_up1"] <= lgd["S_depeg_debt_up2"] + 1e-15).all()
+print(
+    "LGD assertions passed for all variants: finite, 0 <= LGD <= 1, and the expected orderings V1nb <= V1 <= V2, V1 <= V3 <= V3b, V1 <= V4_h3 <= V4_h5, V1 <= S_depeg, "
+    "S_depeg_debt_down12 <= V1 <= S_depeg_debt_up05 <= up1 <= up2."
+)
 
 # ---- memo: V2 if the persistent under-water positions of day 1 were treated as S7 entries -----------------
 pool_with_initial = build_s7_entry_pool(cohorts_all, include_initial_s7=True)
@@ -1087,7 +1170,7 @@ print("\nAssertions passed: ECL = EAD x PD x LGD in every state row; 0 <= ECL_w 
 # %% [markdown]
 # ## 8. Variant comparison
 #
-# Total ECL and ECL/EAD (in basis points of the EAD of the corresponding portfolio) per scenario $\times$ profile for every variant. Two portfolios are shown: the **forward-looking `S2-S6`** portfolio (the wallets whose liquidation within 30 days is still uncertain) and **`ALL`**, which adds the line of wallets already in `S7` at $t$. The last table is the reference premium implied by the `S2-S6` figure, $\mathrm{URP} \approx (\mathrm{ECL}/\mathrm{EAD}) \times 365/30$ in basis points per year. **It is a reference only**: the URP is not calibrated here.
+# Total ECL and ECL/EAD (in basis points of the EAD of the corresponding portfolio) per scenario $\times$ profile for every variant. Two portfolios are shown: the **forward-looking `S2-S6`** portfolio (the wallets whose liquidation within 30 days is still uncertain) and **`ALL`**, which adds the line of wallets already in `S7` at $t$. The last table is the reference premium implied by the `S2-S6` figure, $\mathrm{URP} \approx (\mathrm{ECL}/\mathrm{EAD}) \times 365/30$ in basis points per year. **It is a reference only**: the URP is not calibrated here. The four debt-side de-peg variants (`S_depeg_debt_up05`, `_up1`, `_up2`, `_down12`) close every table: read them against V1 with the break-even debt move $u^*$ of Section 6.1 in mind: an upward move raises the LGD of the wallets whose V1 is already positive and switches on those whose own $u^*$ (which depends on their collateral mix) is below the move, while the downward move can only lower the LGD.
 
 # %%
 def comparison_matrix(metric: str, line: str, scale: float = 1.0) -> pd.DataFrame:
@@ -1117,16 +1200,19 @@ print("\nReference only: implied annualised premium (ECL/EAD of S2-S6) x 365/30,
 display(urp_reference.style.format("{:.2f}"))
 print("\nEAD of the S2-S6 portfolio (USD): " + ", ".join(f"{segment_name(s)} = {variant_tables['V1'].loc[(s[0], s[1], 'S2-S6'), 'ead']:,.0f}" for s in SEGMENTS))
 
-fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=False)
+fig, axes = plt.subplots(2, 2, figsize=(13, 10), sharex=False)
 for ax, segment in zip(axes.ravel(), SEGMENTS):
     values = bp_s2s6[segment_name(segment)]
-    ax.barh(VARIANT_ORDER[::-1], values.to_numpy()[::-1], color=["#c0392b" if v == "V3b" else "#2e86c1" for v in VARIANT_ORDER[::-1]])
+    ax.barh(
+        VARIANT_ORDER[::-1], values.to_numpy()[::-1],
+        color=["#c0392b" if v == "V3b" else ("#8e6bbf" if v in DEBT_VARIANTS else "#2e86c1") for v in VARIANT_ORDER[::-1]],
+    )  # fmt: skip
     ax.set_title(segment_name(segment))
     ax.set_xlabel("ECL/EAD of S2-S6 (bp)")
     ax.set_xlim(left=0, right=max(float(values.max()) * 1.05, 1.0))
     if float(values.max()) == 0.0:
         ax.text(0.5, 0.5, "all variants are 0\n(PD = 0 in every state)", transform=ax.transAxes, ha="center", va="center", fontsize=11)
-fig.suptitle("ECL/EAD by LGD variant (V3b is out of sample)", y=1.0)
+fig.suptitle("ECL/EAD by LGD variant (V3b is out of sample; purple = debt-stablecoin move)", y=1.0)
 plt.tight_layout()
 plt.show()
 
@@ -1213,13 +1299,13 @@ print(breakeven_check.loc[:, ["scenario", "aave_symbol", "ES99 h=1 shock", "brea
 # 1. **Stress > baseline holds for the PD, not always for the ECL.** The 30-day PD is higher in stress for every state and both profiles. The ECL/EAD of V1, V2 and S-depeg is *lower* in stress than in the baseline for profile A (zero against about 0.5-0.7 bp; V0 and V1nb are zero in both): the ES 99% of ETH is 13.9% in the baseline window but only 12.1% in the stress window, which puts it below the WETH break-even shock with bonus (12.85%) in stress and above it in the baseline. This is the pending question of `docs/decisions.md` (the stress ES is lower because the two 730-day windows overlap by about 19 months and the baseline window additionally contains March-August 2022, with its sell-off, which the stress window does not); the sign is restored as soon as the shock is raised (V3, V3b, V4).
 # 2. **Profile B > A holds for the PD in stress, not for the ECL.** In stress the PD of B is higher in the five states. But B holds LINK and UNI, whose lower LT leave a break-even margin of 15%-27%, above almost every ES of the grid, so its LGD is zero in most variants and its ECL/EAD is below that of A in V3b and V4. The "riskier collateral" of B shows in the PD, not in the LGD. In the baseline the comparison cannot be made: the B matrix has no `S7` transition and its `S6` row is empty (PD $= 0$ in every state), which is a rare-event problem of the sample, not evidence of safety. A credibility (Buhlmann-type) or Bayesian smoothing of the B matrix towards the pooled A+B matrix is an option to discuss with the tutor; it is **not implemented**.
 # 3. **Magnitudes.** In the baseline the expected 30-day liquidation incidence of the valuation cohort (about 0.6% in profile A) is of the same size as the in-window incidence of the day-1 cohort. In stress it is about 10% against 3.6%: the valuation portfolio of the crash day is concentrated in the risky states (about 39% of the wallets of profile A in `S4`-`S6`), and the in-sample backtest above showed that the stress chain over-predicts by about a factor of two, so the stress PD should be read as an upper figure. The ECL/EAD of the base candidate V1 is about 0.5 bp for the baseline (about 6 bp per year as a reference premium) and zero in stress; the more severe variants give 3-13 bp (V3), 7-57 bp (V4, $h=3$) and 11-107 bp (V4, $h=5$) for profile A.
-# 4. **Which variants give a non-zero LGD.** V0 and V1nb are exactly zero for every wallet in `S2`-`S6` (no loss without the bonus, and V0 cannot be positive when $HF > 1$). V1 is positive only where the ES of the collateral exceeds the break-even with bonus: WETH-type collateral in the baseline (13.9% against 12.85%), which is 72% of the wallets of profile A; wstETH-heavy wallets (break-even 14.1%) and everything in stress stay at zero. V2 adds the gap risk observed in the baseline (HF slightly under 1 when the liquidation arrives); V3, V3b and V4 enlarge the shock and are positive almost everywhere in profile A; S-depeg is almost indistinguishable from V1 because stablecoins are a negligible part of the collateral of these portfolios.
+# 4. **Which variants give a non-zero LGD.** V0 and V1nb are exactly zero for every wallet in `S2`-`S6` (no loss without the bonus, and V0 cannot be positive when $HF > 1$). V1 is positive only where the ES of the collateral exceeds the break-even with bonus: WETH-type collateral in the baseline (13.9% against 12.85%), which is 72% of the wallets of profile A; wstETH-heavy wallets (break-even 14.1%) and everything in stress stay at zero. V2 adds the gap risk observed in the baseline (HF slightly under 1 when the liquidation arrives); V3, V3b and V4 enlarge the shock and are positive almost everywhere in profile A; S-depeg is almost indistinguishable from V1 because stablecoins are a negligible part of the collateral of these portfolios. The four S-depeg-debt variants move the same V1 formula along the debt-stablecoin axis: an upward move behaves like an extra collateral shock and a downward move (the March 2023 case) can only lower the loss; where each one switches the LGD on is given by the break-even debt move $u^*$ of Section 6.1.
 # 5. **Sensitivity of V2.** The memo of Section 6.4 shows that V2 is fragile: five wallets that were already in `S7` on day 1 (four of them with a Health Factor close to 0: persistent bad debt that was never liquidated) would add tens of basis points in stress if they were counted as entries. They are excluded by construction (they are not transitions), but this has to be discussed before V2 is considered.
 
 # %% [markdown]
 # ## 10. Export of the ECL variants (not for production)
 #
-# One long table is written to `data/02_interim/ecl_variants_not_for_prod.csv` with columns `scenario, profile, variant, state, n, ead, pd30, lgd_mean, ecl, ecl_over_ead`. `state` takes the values `S2` to `S6`, `S7` (already in a liquidation event at $t$, PD = 1), and the subtotal lines `S2-S6` and `ALL`. In state rows $\text{ecl} = \text{ead} \times \text{pd30} \times \text{lgd\_mean}$ exactly; in `S2-S6` and `ALL` `pd30` and `lgd_mean` are EAD-weighted averages and `ecl` is the exact sum. `variant` is one of `V0, V1nb, V1, V2, V3, V3b, V4_h3, V4_h5, S_depeg`; **`V3b` is out of sample** (99.9% on a 730-day window) and **every variant is exploratory**.
+# One long table is written to `data/02_interim/ecl_variants_not_for_prod.csv` with columns `scenario, profile, variant, state, n, ead, pd30, lgd_mean, ecl, ecl_over_ead`. `state` takes the values `S2` to `S6`, `S7` (already in a liquidation event at $t$, PD = 1), and the subtotal lines `S2-S6` and `ALL`. In state rows $\text{ecl} = \text{ead} \times \text{pd30} \times \text{lgd\_mean}$ exactly; in `S2-S6` and `ALL` `pd30` and `lgd_mean` are EAD-weighted averages and `ecl` is the exact sum. `variant` is one of `V0, V1nb, V1, V2, V3, V3b, V4_h3, V4_h5, S_depeg, S_depeg_debt_up05, S_depeg_debt_up1, S_depeg_debt_up2, S_depeg_debt_down12`; **`V3b` is out of sample** (99.9% on a 730-day window) and **every variant is exploratory**.
 #
 # **Checks before writing:** no missing identifiers, `0 <= lgd_mean <= 1`, `0 <= ecl <= ead`, `n` adds up to the valuation cohort of each segment, the subtotals equal the sum of their states. **After writing:** the file is read back, compared exactly with the table in memory, and the V1 totals are recomputed from the file and from the wallet-level arrays.
 
